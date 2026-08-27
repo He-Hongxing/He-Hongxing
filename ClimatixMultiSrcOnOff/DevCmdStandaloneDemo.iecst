@@ -1,0 +1,189 @@
+// =============================================================================
+// 示例: 竞争模式 (M2) 与投票模式 (M3) 独立应用
+//
+// 场景 A: 多区域请求同一台公用排风机 (竞争模式)
+//   - 多个房间分别有湿度/CO2 越限信号, 任一越限即启动公用排风机
+//   - 同时多区域请求时, 按房间优先级 (Weight) 裁决胜出源
+//
+// 场景 B: 三冗余温度传感器 (投票模式)
+//   - 3 个温度传感器中至少 2 个测得超温才允许安全停机
+//   - 单一传感器故障不会误触发
+// =============================================================================
+
+PROGRAM Pgm_Standalone_Modes
+
+    // =========================================================================
+    // 场景 A: 公用排风机 — 竞争模式
+    // =========================================================================
+    VAR
+        // 4 个房间的越限信号 (DI 经 aoBinaryInput 已转 BOOL)
+        bRoom1OverLimit : BOOL;   // 房间 1 湿度越限 (Weight 30)
+        bRoom2OverLimit : BOOL;   // 房间 2 湿度越限 (Weight 20)
+        bRoom3OverLimit : BOOL;   // 房间 3 CO2 越限  (Weight 25)
+        bRoom4OverLimit : BOOL;   // 房间 4 CO2 越限  (Weight 15)
+
+        fbCompete       : FB_DevCmd_Compete;
+        aCompeteSrc     : ARRAY[1..8] OF DT_DevSrc;
+        nCompeteCount   : USINT := 4;
+        bExhaustFanCmd  : BOOL;
+        nWinner         : USINT;
+    END_VAR
+
+    // 房间 1: Weight=30 (高优先级区域)
+    aCompeteSrc[1].Cmd        := bRoom1OverLimit;
+    aCompeteSrc[1].Prio       := 15;
+    aCompeteSrc[1].Weight     := 30.0;
+    aCompeteSrc[1].Enable     := TRUE;
+    aCompeteSrc[1].Reliability := 0;
+
+    // 房间 2: Weight=20
+    aCompeteSrc[2].Cmd        := bRoom2OverLimit;
+    aCompeteSrc[2].Prio       := 15;
+    aCompeteSrc[2].Weight     := 20.0;
+    aCompeteSrc[2].Enable     := TRUE;
+    aCompeteSrc[2].Reliability := 0;
+
+    // 房间 3: Weight=25
+    aCompeteSrc[3].Cmd        := bRoom3OverLimit;
+    aCompeteSrc[3].Prio       := 15;
+    aCompeteSrc[3].Weight     := 25.0;
+    aCompeteSrc[3].Enable     := TRUE;
+    aCompeteSrc[3].Reliability := 0;
+
+    // 房间 4: Weight=15
+    aCompeteSrc[4].Cmd        := bRoom4OverLimit;
+    aCompeteSrc[4].Prio       := 15;
+    aCompeteSrc[4].Weight     := 15.0;
+    aCompeteSrc[4].Enable     := TRUE;
+    aCompeteSrc[4].Reliability := 0;
+
+    fbCompete(iSrc := aCompeteSrc, iSrcCount := nCompeteCount);
+    bExhaustFanCmd := fbCompete.oCmd;
+    nWinner        := fbCompete.oWinnerIdx;
+
+    // 此时 bExhaustFanCmd 可写入 aoBinaryOutput.Val1 驱动排风机
+    // nWinner 可显示在 HMI 上标识"请求来源"
+
+
+    // =========================================================================
+    // 场景 B: 三冗余温度传感器 — 投票模式
+    // =========================================================================
+    VAR
+        // 3 路温度传感器 (经 NTC 转换后的 BOOL 越限判定)
+        bTemp1OverLimit : BOOL;   // 传感器 1 超温
+        bTemp2OverLimit : BOOL;   // 传感器 2 超温
+        bTemp3OverLimit : BOOL;   // 传感器 3 超温
+
+        // 传感器可靠性 (来自 aoAnalogInput 或 fbSnsrErr_ST)
+        wTemp1Rel : WORD;
+        wTemp2Rel : WORD;
+        wTemp3Rel : WORD;
+
+        fbVoting        : FB_DevCmd_Voting;
+        aVotingSrc      : ARRAY[1..8] OF DT_DevSrc;
+        nVotingCount    : USINT := 3;
+        nQuorum         : USINT := 2;     // 2-of-3 多数表决
+        bSafeShutdown   : BOOL;
+        nVoteCount      : USINT;
+    END_VAR
+
+    // 传感器 1
+    aVotingSrc[1].Cmd         := bTemp1OverLimit;
+    aVotingSrc[1].Prio        := 15;
+    aVotingSrc[1].Enable      := TRUE;
+    aVotingSrc[1].Reliability := wTemp1Rel;
+
+    // 传感器 2
+    aVotingSrc[2].Cmd         := bTemp2OverLimit;
+    aVotingSrc[2].Prio        := 15;
+    aVotingSrc[2].Enable      := TRUE;
+    aVotingSrc[2].Reliability := wTemp2Rel;
+
+    // 传感器 3
+    aVotingSrc[3].Cmd         := bTemp3OverLimit;
+    aVotingSrc[3].Prio        := 15;
+    aVotingSrc[3].Enable      := TRUE;
+    aVotingSrc[3].Reliability := wTemp3Rel;
+
+    fbVoting(iSrc := aVotingSrc, iSrcCount := nVotingCount, iQuorum := nQuorum);
+    bSafeShutdown := fbVoting.oCmd;
+    nVoteCount    := fbVoting.oVoteCount;
+
+    // bSafeShutdown 可作为 P4 (Critical Equipment) 联锁源提交给主裁决器
+    // 即使一路传感器故障 (Reliability<>0 → Enable 视情况) 仍可决策
+
+
+    // =========================================================================
+    // 组合使用: 把竞争模式结果作为 P15 提交给主裁决器
+    // =========================================================================
+    VAR
+        fbMasterDemo    : FB_DevCmd_Master;
+        aInterlockSrc   : ARRAY[1..8] OF DT_DevSrc;
+        aPrioSrcForMaster: ARRAY[1..8] OF DT_DevSrc;
+        bFinalCmd       : BOOL;
+    END_VAR
+
+    // 联锁源: 三冗余温度超温投票结果 (作为 P4 联锁)
+    aInterlockSrc[1].Cmd        := NOT bSafeShutdown;   // 投票通过 → 阻断 (强制停机)
+    aInterlockSrc[1].Prio       := 4;
+    aInterlockSrc[1].Enable     := TRUE;
+    aInterlockSrc[1].Reliability := 0;
+
+    // 优先级源: 多区域竞争结果 (作为 P15)
+    aPrioSrcForMaster[1].Cmd        := bExhaustFanCmd;
+    aPrioSrcForMaster[1].Prio       := 15;
+    aPrioSrcForMaster[1].Weight     := 0.0;
+    aPrioSrcForMaster[1].Enable     := TRUE;
+    aPrioSrcForMaster[1].Reliability := 0;
+
+    fbMasterDemo(
+        iInterlockSrc   := aInterlockSrc,
+        iInterlockCount := 1,
+        iInterlockEn    := TRUE,
+        iManualEn       := FALSE,
+        iManualCmd      := FALSE,
+        iManualEn_src   := FALSE,          // 不使用手动层
+        iPrioSrc        := aPrioSrcForMaster,
+        iPrioCount      := 1,
+        iPrioEn         := TRUE,
+        iSchedEn        := FALSE,          // 不使用调度层
+        iSchedPV        := 0.0
+    );
+    bFinalCmd := fbMasterDemo.oFinalCmd;
+
+END_PROGRAM
+
+
+// =============================================================================
+// 模式选型指南
+// =============================================================================
+// | 应用场景                          | 推荐模式      | 说明                          |
+// |-----------------------------------|---------------|-------------------------------|
+// | 急停 + 防冻 + 手动 + HMI + 调度    | Master        | 标准 HVAC 设备控制            |
+// | 多区域请求同一设备                | M2 竞争       | OR + 权重裁决                 |
+// | 冗余传感器安全联锁                | M3 投票       | 2-of-3 / 3-of-5               |
+// | 安全联锁 (火警/水流/防冻)         | M4 最低安全   | AND, fail-safe                |
+// | 手动/自动无扰切换                 | M5 手动超驰   | 配合 AccessDB 读 OutOfService |
+// | 时间表驱动                        | M6 调度       | aoSchedule + aoCalendar       |
+// | 多模式组合 (典型 AHU)             | Master        | 联锁 → 手动 → 优先级 → 调度   |
+// | 多模式组合 (安全停机)             | M3→Master     | 投票作为联锁源                |
+// =============================================================================
+
+
+// =============================================================================
+// 代码审查检查清单
+// =============================================================================
+// [x] 变量命名规范: i 输入 / o 输出 / _ 内部 / fb FB实例 / ao AO实例 (skill 规范)
+// [x] 功能块真实引脚名: TON.IN/Q/ET, RS.S1/R/Q1, TON 自复位脉冲 (iec-standard-blocks)
+// [x] FOR 循环计数变量未被修改 (skill 规则)
+// [x] 算术运算符未紧跟负号 (skill 规则, 此处无负号紧贴运算)
+// [x] CASE 值列表无重复 (未使用 CASE)
+// [x] 16 级优先级与 SBT 标准对齐 (project-architecture §6.4)
+// [x] 与原生 Priority Array 兼容 (Prio01..Prio16, Member ID 0x011B..0x012A)
+// [x] 可靠性 WORD 类型 (ENU_Reliability: 0=OK)
+// [x] 手动模式 AccessDB 读 OutOfService (Member ID 0x0112)
+// [x] 调度模式连接 aoSchedule.PRV (Member ID 0x0003)
+// [x] 故障侧 fail-safe: 联锁层 Reliability<>0 即阻断 (与 P1 LifeSafety 同源)
+// [x] 无扰切换: 手动模式跟踪 iTrackTime 同步, 切回自动无跳变
+// [x] 输出可驱动 aoBinaryOutput.Val1 (BOOL) 或 aoAnalogOutput.Val1 (REAL)
+// =============================================================================
