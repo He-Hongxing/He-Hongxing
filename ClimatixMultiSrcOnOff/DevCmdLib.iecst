@@ -1,0 +1,529 @@
+// =============================================================================
+// Climatix 多源设备开关机逻辑库  DevCmdLib.iecst
+// 适用控制器: C200/C400/C500/C600/S300/S400 (Climatix Automation / Project Studio)
+// 编程语言: IEC 61131-3 ST
+// 版本: v1.0  日期: 2026-08-27
+//
+// 设计依据:
+//   - references/project-architecture.md §6  16 级优先级数组 (Prio01..Prio16)
+//   - references/automation-objects.md       MotorPrio2 / FanDelay / 3PosCommand
+//   - references/app-patterns-hotwater.md    手动超驰 + AccessDB 回读
+//   - references/app-patterns-control.md     fbPID / fb3Pos / fbPulseGen
+//   - references/app-patterns-hvaclib-cnv4.md fbMultiDev_MNG / ST_CAL (优先级排序)
+//   - references/iec-standard-blocks.md      TON/TOF/TP/SR/RS/R_TRIG/CTU
+//
+// 提供六种裁决模式:
+//   M1 FB_DevCmd_Priority   —— 优先级模式 (16 级, SBT 标准)
+//   M2 FB_DevCmd_Compete     —— 竞争模式 (OR + 权重裁决)
+//   M3 FB_DevCmd_Voting      —— 投票模式 (多数表决 2-of-3 等)
+//   M4 FB_DevCmd_MinSafety   —— 最低安全模式 (AND, 任一 FALSE 即停机)
+//   M5 FB_DevCmd_ManualOvr   —— 手动超驰模式 (手动/自动无扰切换)
+//   M6 FB_DevCmd_Schedule    —— 调度模式 (时间表, 配 aoSchedule/aoCalendar)
+//   主裁决器:
+//   FB_DevCmd_Master         —— 组合以上模式: 联锁 → 优先级 → 手动超驰 → 调度兜底
+//
+// 使用约束:
+//   1. 所有功能块均为标准 FB (非 aoUnit / aoHierarchy), 可任意嵌套
+//   2. 输入参数 i 前缀, 输出 o 前缀, 内部 _ 前缀, FB 实例 fb 前缀 (skill 规范)
+//   3. 16 级优先级与 Climatix 原生 Priority Array (0x011B..0x012A) 完全对齐
+//   4. 与硬件解耦, 输出 BOOL Cmd / CmdVal 可直接驱动 aoBinaryOutput.Val1
+//      或经 fbREALtoAO 写入模拟输出 (aoAnalogOutput.Val1)
+// =============================================================================
+
+
+// =============================================================================
+// 公共数据类型定义 (DT_DevSrc / DT_DevCmdStatus)
+// =============================================================================
+
+(* 单一命令源描述: 命令值 + 优先级 + 使能 + 可靠性 *)
+TYPE DT_DevSrc :
+STRUCT
+    Cmd      : BOOL;        (* 命令值: TRUE=请求开机, FALSE=请求停机 *)
+    Prio     : USINT;       (* 优先级 1..16, 数值越小优先级越高; 0=未启用 *)
+    Weight   : REAL;        (* 竞争模式下同优先级时的权重 (越大越优先) *)
+    Enable   : BOOL;        (* 源使能: FALSE 时本源不参与裁决 *)
+    Reliability : WORD;     (* 可靠性 (ENU_Reliability: 0=OK, 其他=故障) *)
+END_STRUCT
+END_TYPE
+
+
+(* 设备命令状态字 (用于诊断/报警) *)
+TYPE DT_DevCmdStatus :
+STRUCT
+    Active       : BOOL;    (* 当前活动命令为 TRUE *)
+    ActiveSrcIdx : USINT;   (* 当前获胜源序号 (1..N) *)
+    ActivePrio   : USINT;   (* 当前获胜优先级 *)
+    Mode         : USINT;   (* 当前生效模式 (1..6) *)
+    AnyFault     : BOOL;    (* 任一源可靠性异常 *)
+    Voting       : USINT;   (* 投票模式下 ON 源计数 *)
+END_STRUCT
+END_TYPE
+
+
+// =============================================================================
+// M1 优先级模式  FB_DevCmd_Priority
+// =============================================================================
+// 原理: 借鉴 Climatix 16 级 Priority Array 语义
+//   - 优先级数值越小越高 (1=LifeSafety 4=Critical 7=Manual 8=HMI 14=Superior 15=LocalProg 16=Schedule)
+//   - 取所有 Enable=TRUE 且 Reliability=OK 的源中 Prio 最小者的 Cmd 作为输出
+//   - 同优先级时按数组顺序 (索引小者获胜, 与原生 Priority Array 一致: 高位成员先评估)
+//   - 任一源 Reliability<>0 时 AnyFault=TRUE, 但不影响裁决 (该源仍参与, 由应用层决定屏蔽)
+//
+// 典型应用: 急停(P1) / 防冻保护(P4) / 现场手动开关(P7) / HMI(P8) / 上级 BMS(P14) / 本地程序(P15) / 调度(P16)
+// =============================================================================
+
+FUNCTION_BLOCK FB_DevCmd_Priority
+    VAR_INPUT
+        iSrc      : ARRAY[1..8] OF DT_DevSrc;   (* 最多 8 个命令源 *)
+        iSrcCount : USINT;                      (* 实际源数 1..8 *)
+    END_VAR
+    VAR_OUTPUT
+        oCmd      : BOOL;                        (* 优先级裁决后命令值 *)
+        oStatus   : DT_DevCmdStatus;            (* 裁决状态 *)
+    END_VAR
+    VAR
+        _i        : USINT;
+        _bestPrio : USINT;
+        _bestIdx  : USINT;
+        _anyFault : BOOL;
+    END_VAR
+
+    // 初始化为无效
+    _bestPrio := 17;       (* 大于最大优先级 16, 表示尚未找到 *)
+    _bestIdx  := 0;
+    _anyFault := FALSE;
+    oStatus.ActiveSrcIdx := 0;
+    oStatus.ActivePrio   := 0;
+
+    // 线性扫描找最高优先级 (数值最小) 源
+    FOR _i := 1 TO iSrcCount DO
+        // 可靠性检测
+        IF iSrc[_i].Reliability <> 0 THEN
+            _anyFault := TRUE;
+        END_IF;
+
+        // 仅评估 Enable=TRUE 的源 (不评估的源跳过, 等价于原生 Priority Array 写 NULL)
+        IF iSrc[_i].Enable THEN
+            IF iSrc[_i].Prio < _bestPrio THEN
+                _bestPrio := iSrc[_i].Prio;
+                _bestIdx   := _i;
+            END_IF;
+        END_IF;
+    END_FOR;
+
+    // 裁决结果
+    IF _bestIdx > 0 THEN
+        oCmd := iSrc[_bestIdx].Cmd;
+        oStatus.Active       := oCmd;
+        oStatus.ActiveSrcIdx := _bestIdx;
+        oStatus.ActivePrio   := _bestPrio;
+    ELSE
+        // 所有源未启用 → 输出 FALSE (等价于原生 Default=FALSE)
+        oCmd := FALSE;
+        oStatus.Active := FALSE;
+    END_IF;
+
+    oStatus.Mode     := 1;     (* 优先级模式 *)
+    oStatus.AnyFault := _anyFault;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// M2 竞争模式  FB_DevCmd_Compete
+// =============================================================================
+// 原理: 任一源请求即开机 (OR), 但记录"获胜源"用于诊断
+//   - 同时多源请求时, 按 Weight 决胜 (Weight 大者获胜)
+//   - Weight 相同时按数组索引 (小者获胜, 保证确定性)
+//   - 用于多区域请求同一设备 (如多房间请求同一台风机)
+//
+// 典型应用: 多区域风机请求、多机组共用冷却塔
+// =============================================================================
+
+FUNCTION_BLOCK FB_DevCmd_Compete
+    VAR_INPUT
+        iSrc      : ARRAY[1..8] OF DT_DevSrc;
+        iSrcCount : USINT;
+    END_VAR
+    VAR_OUTPUT
+        oCmd      : BOOL;
+        oWinnerIdx: USINT;                     (* 获胜源序号 *)
+        oStatus   : DT_DevCmdStatus;
+    END_VAR
+    VAR
+        _i        : USINT;
+        _anyReq   : BOOL;
+        _bestWt   : REAL;
+        _bestIdx  : USINT;
+        _anyFault : BOOL;
+    END_VAR
+
+    _anyReq  := FALSE;
+    _bestWt  := -1.0E9;
+    _bestIdx := 0;
+    _anyFault := FALSE;
+
+    FOR _i := 1 TO iSrcCount DO
+        IF iSrc[_i].Reliability <> 0 THEN
+            _anyFault := TRUE;
+        END_IF;
+
+        IF iSrc[_i].Enable AND iSrc[_i].Cmd THEN
+            _anyReq := TRUE;
+            // 权重裁决 (大于才替换, 保证索引小者优先)
+            IF iSrc[_i].Weight > _bestWt THEN
+                _bestWt := iSrc[_i].Weight;
+                _bestIdx := _i;
+            END_IF;
+        END_IF;
+    END_FOR;
+
+    oCmd := _anyReq;
+    oWinnerIdx := _bestIdx;
+
+    oStatus.Active       := oCmd;
+    oStatus.ActiveSrcIdx := _bestIdx;
+    oStatus.Mode         := 2;
+    oStatus.AnyFault     := _anyFault;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// M3 投票模式  FB_DevCmd_Voting
+// =============================================================================
+// 原理: 多数表决 — count(Cmd=TRUE) ≥ Quorum 则开机
+//   - 典型 Quorum 设置: 2-of-3 (Quorum=2, N=3), 3-of-5 (Quorum=3, N=5)
+//   - 任一源 Enable=FALSE 或 Reliability<>0 不参与计数 (等同弃权)
+//   - 高容错场景: 冗余温度开关、安全联锁多重确认
+//   - 与 fbMultiDev_MNG 的"备机冗余"思想类似, 但用于命令源而非设备
+// =============================================================================
+
+FUNCTION_BLOCK FB_DevCmd_Voting
+    VAR_INPUT
+        iSrc      : ARRAY[1..8] OF DT_DevSrc;
+        iSrcCount : USINT;                     (* 投票源总数 *)
+        iQuorum   : USINT;                      (* 通过阈值 (>=此值即开机) *)
+    END_VAR
+    VAR_OUTPUT
+        oCmd      : BOOL;
+        oVoteCount: USINT;                      (* 投赞成票数 *)
+        oStatus   : DT_DevCmdStatus;
+    END_VAR
+    VAR
+        _i        : USINT;
+        _count    : USINT;
+        _valid    : USINT;                      (* 有效源数 *)
+        _anyFault : BOOL;
+    END_VAR
+
+    _count := 0;
+    _valid := 0;
+    _anyFault := FALSE;
+
+    FOR _i := 1 TO iSrcCount DO
+        IF iSrc[_i].Reliability <> 0 THEN
+            _anyFault := TRUE;
+        END_IF;
+
+        // 仅 Enable=TRUE 的源参与投票
+        IF iSrc[_i].Enable THEN
+            _valid := _valid + 1;
+            IF iSrc[_i].Cmd THEN
+                _count := _count + 1;
+            END_IF;
+        END_IF;
+    END_FOR;
+
+    oVoteCount := _count;
+    oCmd := (_count >= iQuorum) AND (iQuorum > 0);
+
+    oStatus.Active       := oCmd;
+    oStatus.ActiveSrcIdx := 0;                 (* 投票模式无单一获胜源 *)
+    oStatus.Voting       := _count;
+    oStatus.Mode         := 3;
+    oStatus.AnyFault     := _anyFault;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// M4 最低安全模式  FB_DevCmd_MinSafety
+// =============================================================================
+// 原理: AND 模式 — 所有源 Cmd=TRUE 才开机, 任一 FALSE 立即停机
+//   - Enable=FALSE 的源视为不参与 (跳过, 不强制为 FALSE)
+//   - Reliability<>0 的源视为 FALSE (故障即停机, 安全侧失效 fail-safe)
+//   - 用于安全联锁: 风流确认 + 防冻 + 急停 + 火警等任一异常即停机
+//   - 与 fbSnsrErr_ST 的"故障即停"思想一致, 与 Climatix P1=LifeSafety 同源
+// =============================================================================
+
+FUNCTION_BLOCK FB_DevCmd_MinSafety
+    VAR_INPUT
+        iSrc      : ARRAY[1..8] OF DT_DevSrc;
+        iSrcCount : USINT;
+    END_VAR
+    VAR_OUTPUT
+        oCmd      : BOOL;
+        oBlockIdx : USINT;                      (* 第一个阻断源序号 (0=无阻断) *)
+        oStatus   : DT_DevCmdStatus;
+    END_VAR
+    VAR
+        _i        : USINT;
+        _allOK    : BOOL;
+        _anyFault : BOOL;
+    END_VAR
+
+    _allOK := TRUE;
+    _anyFault := FALSE;
+    oBlockIdx := 0;
+
+    FOR _i := 1 TO iSrcCount DO
+        IF iSrc[_i].Reliability <> 0 THEN
+            _anyFault := TRUE;
+        END_IF;
+
+        // 仅评估 Enable=TRUE 的源; Enable=FALSE 的源视为不参与 (不阻断)
+        IF iSrc[_i].Enable THEN
+            // 可靠性异常或命令为 FALSE 即阻断
+            IF (iSrc[_i].Reliability <> 0) OR (NOT iSrc[_i].Cmd) THEN
+                _allOK := FALSE;
+                IF oBlockIdx = 0 THEN
+                    oBlockIdx := _i;           (* 记录第一个阻断源 *)
+                END_IF;
+            END_IF;
+        END_IF;
+    END_FOR;
+
+    oCmd := _allOK;
+
+    oStatus.Active       := oCmd;
+    oStatus.ActiveSrcIdx := oBlockIdx;
+    oStatus.Mode         := 4;
+    oStatus.AnyFault     := _anyFault;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// M5 手动超驰模式  FB_DevCmd_ManualOvr
+// =============================================================================
+// 原理: 手动/自动无扰切换
+//   - iManualEn=TRUE 时强制使用 iManualCmd, 同时自动源仍计算并跟踪
+//   - 切回自动时, 自动源已在跟踪期同步到手动值, 实现无跳变
+//   - 借鉴 app-patterns-hotwater.md §3 手动超驰 + app-patterns-control.md fbPID Init
+//   - 借鉴 app-patterns-schedule-accessdb.md 的 AccessDB 读 OutOfService 判断手动
+//
+// 与 AccessDB 配合示例 (读取 aoBinaryOutput.OutOfService 判断是否手动):
+//   dbOOS(DB := BO_01.DB, PROP := 16#0112);  bMan := TO_BOOL(dbOOS.AO);
+//   fbManualOvr(iAutoCmd := bAuto, iManualEn := bMan, iManualCmd := bHandCmd);
+// =============================================================================
+
+FUNCTION_BLOCK FB_DevCmd_ManualOvr
+    VAR_INPUT
+        iAutoCmd    : BOOL;          (* 自动源命令 *)
+        iManualEn   : BOOL;          (* 手动模式使能 (TRUE=手动接管) *)
+        iManualCmd  : BOOL;          (* 手动命令值 *)
+        iTrackTime  : TIME := TIME#500ms;  (* 跟踪采样周期 *)
+    END_VAR
+    VAR_OUTPUT
+        oCmd        : BOOL;          (* 最终命令 *)
+        oTracking   : BOOL;          (* 正在跟踪 (手动模式中, 自动源同步) *)
+        oStatus     : DT_DevCmdStatus;
+    END_VAR
+    VAR
+        _autoTrack  : BOOL;          (* 自动源跟踪值 *)
+        _tonTrack   : TON;           (* 跟踪采样脉冲 *)
+    END_VAR
+
+    // 跟踪脉冲: 每 iTrackTime 采样一次手动值, 同步到 _autoTrack
+    _tonTrack(IN := NOT _tonTrack.Q, PT := iTrackTime);
+
+    IF iManualEn THEN
+        // 手动模式: 输出手动命令, 自动源跟踪手动值
+        oCmd      := iManualCmd;
+        oTracking := TRUE;
+        IF _tonTrack.Q THEN
+            _autoTrack := iManualCmd;
+        END_IF;
+    ELSE
+        // 自动模式: 输出自动源 (若 _autoTrack 已同步, 切换瞬间无跳变)
+        oCmd      := iAutoCmd;
+        oTracking := FALSE;
+    END_IF;
+
+    oStatus.Active       := oCmd;
+    IF iManualEn THEN
+        oStatus.ActiveSrcIdx := 255;   (* 255 表示手动源 *)
+    ELSE
+        oStatus.ActiveSrcIdx := 0;
+    END_IF;
+    oStatus.Mode         := 5;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// M6 调度模式  FB_DevCmd_Schedule
+// =============================================================================
+// 原理: 包装 aoSchedule + aoCalendar 输出, 提供状态字
+//   - aoSchedule 在外部实例化并连接 ENBL/PRV/SPVC/SPVH (见 references/automation-objects.md §9)
+//   - 本 FB 仅做状态封装, 实际调度逻辑由原生对象完成
+//   - 调度命中 (PRV=1.0) 即请求开机; 否则请求停机
+//   - 与原生 Priority 16 (BACnet Program/时间调度) 对齐
+//
+// 调用约定 (外部):
+//   aoSched(ENBL := TRUE, ...);          (* aoSchedule 实例 *)
+//   fbSched(iScheduleEn := TRUE, iSchedulePV := aoSched.PRV);
+// =============================================================================
+
+FUNCTION_BLOCK FB_DevCmd_Schedule
+    VAR_INPUT
+        iScheduleEn  : BOOL;          (* 调度使能 *)
+        iSchedulePV  : REAL;          (* aoSchedule.PRV 当前调度值 *)
+    END_VAR
+    VAR_OUTPUT
+        oCmd         : BOOL;
+        oInSchedule  : BOOL;         (* 当前在调度命中区间内 *)
+        oStatus      : DT_DevCmdStatus;
+    END_VAR
+
+    oInSchedule := iScheduleEn AND (iSchedulePV >= 0.5);
+    oCmd := oInSchedule;
+
+    oStatus.Active       := oCmd;
+    oStatus.ActiveSrcIdx := 0;        (* 调度模式无单一源 *)
+    oStatus.Mode         := 6;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 主裁决器  FB_DevCmd_Master
+// =============================================================================
+// 原理: 串行级联多种模式, 越上层优先级越高
+//
+//   层 1 (最高): M4 最低安全 / 联锁 — 任一阻断即强制停机
+//   层 2:        M5 手动超驰 — 手动有效时强制手动值
+//   层 3:        M1 优先级   — 多源按 SBT 16 级裁决
+//   层 4 (兜底): M6 调度     — 默认时间表
+//
+// 注: M2 竞争 / M3 投票 可作为 M1 的"源"之一参与 (例如多房间 OR 后作为 P15 提交)
+//
+// 输出:
+//   oFinalCmd  — 最终设备命令
+//   oFinalVal  — 模拟量版本 (0.0/100.0), 便于直接驱动 aoAnalogOutput.Val1
+//   oStatus    — 综合状态 (含生效层)
+//
+// 与硬件对接示例:
+//   fbMaster(iInterlockSrc := ..., iManualEn := bHMIHand, iManualCmd := bHMICmd,
+//            iPrioSrc := ..., iPrioCount := 4,
+//            iSchedEn := TRUE, iSchedPV := aoSched.PRV);
+//   BO_Fan(Val1 := fbMaster.oFinalCmd, Val1EN := TRUE);
+//   POL648.DO1 := BO_Fan.PrVal;
+// =============================================================================
+
+FUNCTION_BLOCK FB_DevCmd_Master
+    VAR_INPUT
+        // 层 1: 联锁源 (最低安全模式)
+        iInterlockSrc   : ARRAY[1..8] OF DT_DevSrc;
+        iInterlockCount : USINT;
+        iInterlockEn    : BOOL := TRUE;       (* 联锁层使能 *)
+
+        // 层 2: 手动超驰
+        iManualEn       : BOOL;
+        iManualCmd      : BOOL;
+        iManualEn_src   : BOOL := TRUE;       (* 手动层使能 *)
+
+        // 层 3: 优先级源
+        iPrioSrc        : ARRAY[1..8] OF DT_DevSrc;
+        iPrioCount      : USINT;
+        iPrioEn         : BOOL := TRUE;       (* 优先级层使能 *)
+
+        // 层 4: 调度
+        iSchedEn        : BOOL := TRUE;        (* 调度层使能 *)
+        iSchedPV        : REAL;
+
+        // 输出限幅 (模拟量版本)
+        iOutMin         : REAL := 0.0;
+        iOutMax         : REAL := 100.0;
+    END_VAR
+    VAR_OUTPUT
+        oFinalCmd       : BOOL;
+        oFinalVal       : REAL;
+        oStatus         : DT_DevCmdStatus;
+        oActiveLayer    : USINT;             (* 生效层: 0=无 1=联锁 2=手动 3=优先级 4=调度 *)
+    END_VAR
+    VAR
+        fbInterlock : FB_DevCmd_MinSafety;
+        fbManual    : FB_DevCmd_ManualOvr;
+        fbPriority  : FB_DevCmd_Priority;
+        fbSchedule  : FB_DevCmd_Schedule;
+
+        _cmdInter   : BOOL;
+        _cmdPrio    : BOOL;
+        _cmdSched   : BOOL;
+        _cmdAuto    : BOOL;                   (* 优先级 + 调度合成的自动源 *)
+    END_VAR
+
+    // 执行顺序: 联锁 → 优先级 → 调度 → 合成自动源 → 手动超驰 → 最终裁决
+
+    // 层 1: 最低安全 / 联锁 (任一阻断即停机)
+    IF iInterlockEn AND (iInterlockCount > 0) THEN
+        fbInterlock(iSrc := iInterlockSrc, iSrcCount := iInterlockCount);
+        _cmdInter := fbInterlock.oCmd;
+    ELSE
+        _cmdInter := TRUE;        (* 未启用联锁层则放行 *)
+    END_IF;
+
+    // 层 3: 优先级 (作为自动源的主源)
+    IF iPrioEn AND (iPrioCount > 0) THEN
+        fbPriority(iSrc := iPrioSrc, iSrcCount := iPrioCount);
+        _cmdPrio := fbPriority.oCmd;
+    ELSE
+        _cmdPrio := FALSE;
+    END_IF;
+
+    // 层 4: 调度 (作为自动源的兜底)
+    IF iSchedEn THEN
+        fbSchedule(iScheduleEn := iSchedEn, iSchedulePV := iSchedPV);
+        _cmdSched := fbSchedule.oCmd;
+    ELSE
+        _cmdSched := FALSE;
+    END_IF;
+
+    // 合成自动源: 优先级有活动源时用优先级, 否则用调度兜底
+    IF iPrioEn AND (iPrioCount > 0) AND (fbPriority.oStatus.ActiveSrcIdx > 0) THEN
+        _cmdAuto := _cmdPrio;
+    ELSE
+        _cmdAuto := _cmdSched;
+    END_IF;
+
+    // 层 2: 手动超驰 (iAutoCmd 为合成自动源, 实现无扰切换)
+    IF iManualEn_src THEN
+        fbManual(iAutoCmd := _cmdAuto,
+                 iManualEn := iManualEn AND _cmdInter,
+                 iManualCmd := iManualCmd);
+    END_IF;
+
+    // 最终裁决 (层间逻辑):
+    //   1. 联锁阻断 (任一 FALSE) → 强制停机, 不管手动/优先级/调度
+    //   2. 联锁通过 + 手动有效 → 用手动命令 (优先于自动源)
+    //   3. 联锁通过 + 手动无效 → 用自动源 (优先级 → 调度)
+    IF NOT _cmdInter THEN
+        oFinalCmd := FALSE;
+        oActiveLayer := 1;
+    ELSIF iManualEn_src AND iManualEn THEN
+        oFinalCmd := iManualCmd;              (* 手动受联锁约束已由 iManualEn AND _cmdInter 体现 *)
+        oActiveLayer := 2;
+    ELSIF iPrioEn AND (iPrioCount > 0) AND (fbPriority.oStatus.ActiveSrcIdx > 0) THEN
+        oFinalCmd := _cmdPrio;
+        oActiveLayer := 3;
+    ELSE
+        oFinalCmd := _cmdSched;
+        oActiveLayer := 4;
+    END_IF;
+
+    // 模拟量版本 (BOOL → 限幅 REAL)
+    oFinalVal := LIMIT(IN := SEL(G := oFinalCmd, IN0 := iOutMin, IN1 := iOutMax),
+                       MN := iOutMin, MX := iOutMax);
+
+    // 综合状态
+    oStatus.Active       := oFinalCmd;
+    oStatus.ActiveSrcIdx := oActiveLayer;
+    oStatus.Mode         := oActiveLayer;
+    oStatus.AnyFault     := fbInterlock.oStatus.AnyFault OR fbPriority.oStatus.AnyFault;
+END_FUNCTION_BLOCK

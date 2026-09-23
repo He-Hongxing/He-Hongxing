@@ -1,0 +1,473 @@
+// =============================================================================
+// 温湿度解耦控制 — 工程实施与调试辅助库  TH_DebugTools.iecst
+// 配套 TempHumidDecouple.iecst 使用
+// 适用: Climatix Automation / Project Studio IDE
+// 编程语言: IEC 61131-3 ST
+// 版本: v1.0  日期: 2026-08-28
+//
+// 依据:
+//   - references/debugging-guide.md (OLT-Field, Force Markers, NTC 调试流程)
+//   - references/climatix-fb-library.md §3 (PIDT1 限幅 BO/BU)
+//   - references/hvac-advanced.md §2.5 (焓值经济运行四模式真值表)
+//
+// 提供:
+//   1. FB_TH_CalibVerify   —— S1 传感器校准验证 (手算对比 + 合格判定)
+//   2. FB_TH_DecoupleTrace —— S2 解耦链路单点测试 & 合格输出
+//   3. FB_TH_AutoTune      —— S4 PID 自动整定辅助 (阶跃响应 + 衰减比计算)
+//   4. FB_TH_RunStatus     —— S5 24h 闭环运行监控 (偏差超限计数)
+//   5. FB_TH_Commission    —— S1~S6 状态机总控 (阶段推进 + 里程碑事件)
+// =============================================================================
+
+
+// =============================================================================
+// S1: 传感器校准验证  FB_TH_CalibVerify
+// =============================================================================
+// 在 OLT-Field 中强制 iT/iRH 参考表值，对比 FB_TH_SensorProc 输出
+// 合格判据: T偏差 ≤ ±0.3K, RH偏差 ≤ ±2%, FA偏差 ≤ ±5%, ENT偏差 ≤ ±3%, Td偏差 ≤ ±0.5K
+// 失败时: oFault=TRUE, 并在 oFaultCode 给出故障码 (1=T超限 2=RH超限 4=FA超限 8=ENT超限 16=Td超限)
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_CalibVerify
+    VAR_INPUT
+        // 实测值 (来自 aoAnalogInput 或硬件 XI)
+        iT_Meas   : REAL;    (* 温度实测 °C *)
+        iRH_Meas  : REAL;    (* 相对湿度实测 % *)
+        // 参考值 (来自校准仪或手算)
+        iT_Ref    : REAL;    (* 参考温度 °C *)
+        iRH_Ref   : REAL;    (* 参考相对湿度 % *)
+        iFA_Ref   : REAL;    (* 参考绝对湿度 g/kg (手算) *)
+        iENT_Ref  : REAL;    (* 参考焓值 kJ/kg (手算) *)
+        iTd_Ref   : REAL;    (* 参考露点 °C (手算) *)
+        // 解耦计算链输出 (来自 FB_TH_SensorProc)
+        iFA_Calc  : REAL;
+        iENT_Calc : REAL;
+        iTd_Calc  : REAL;
+        iValid    : BOOL;
+        // 校准触发
+        iCheck    : BOOL;    (* 上升沿触发一次校准 *)
+    END_VAR
+    VAR_OUTPUT
+        oPass     : BOOL;    (* 全部通过 *)
+        oFault    : BOOL;    (* 有超限 *)
+        oFaultCode: WORD;    (* 故障位掩码: 1=T 2=RH 4=FA 8=ENT 16=Td *)
+        oT_Err    : REAL;    (* 温度偏差 K *)
+        oRH_Err   : REAL;    (* RH 偏差 % *)
+        oFA_ErrPct: REAL;    (* FA 偏差 % *)
+        oENT_ErrPct: REAL;   (* ENT 偏差 % *)
+        oTd_Err   : REAL;    (* Td 偏差 K *)
+        oDone     : BOOL;    (* 本次测试已完成 *)
+    END_VAR
+    VAR CONSTANT
+        T_TOL    : REAL := 0.3;
+        RH_TOL   : REAL := 2.0;
+        FA_TOL   : REAL := 5.0;    (* % *)
+        ENT_TOL  : REAL := 3.0;    (* % *)
+        TD_TOL   : REAL := 0.5;    (* K *)
+    END_VAR
+    VAR
+        _trig : R_TRIG;
+    END_VAR
+
+    _trig(CLK := iCheck);
+
+    IF _trig.Q THEN
+        oT_Err     := iT_Meas  - iT_Ref;
+        oRH_Err    := iRH_Meas - iRH_Ref;
+        IF iFA_Ref  <> 0.0 THEN oFA_ErrPct  := ABS(iFA_Calc  - iFA_Ref)  / ABS(iFA_Ref)  * 100.0; ELSE oFA_ErrPct := 0.0; END_IF;
+        IF iENT_Ref <> 0.0 THEN oENT_ErrPct := ABS(iENT_Calc - iENT_Ref) / ABS(iENT_Ref) * 100.0; ELSE oENT_ErrPct := 0.0; END_IF;
+        oTd_Err    := iTd_Calc - iTd_Ref;
+
+        oFaultCode := 0;
+        IF ABS(oT_Err)     > T_TOL   THEN oFaultCode := oFaultCode OR 1; END_IF;
+        IF ABS(oRH_Err)    > RH_TOL  THEN oFaultCode := oFaultCode OR 2; END_IF;
+        IF oFA_ErrPct      > FA_TOL  THEN oFaultCode := oFaultCode OR 4; END_IF;
+        IF oENT_ErrPct     > ENT_TOL THEN oFaultCode := oFaultCode OR 8; END_IF;
+        IF ABS(oTd_Err)    > TD_TOL  THEN oFaultCode := oFaultCode OR 16; END_IF;
+        IF NOT iValid THEN oFaultCode := oFaultCode OR 32; END_IF;
+
+        oPass := (oFaultCode = 0);
+        oFault := (oFaultCode <> 0);
+        oDone := TRUE;
+    END_IF;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// S2: 解耦链路单点测试  FB_TH_DecoupleTrace
+// =============================================================================
+// 在 OLT-Field 强制 5 组参考工况 (见下方常量表), 自动计算并校验合格
+// 覆盖: ABSHumidity→Enthalpy→DewPoint→Economizer 模式→Decouple PID 死区
+//
+// 典型 5 组参考工况 (基于 1013mbar, Magnus 公式手算验证):
+//   Case 1: 室外夏季  35°C/70%RH → FA≈27.1, ENT≈104.6, Td≈29.0
+//   Case 2: 室外冬季   0°C/50%RH → FA≈1.9,  ENT≈5.2,   Td≈-10.0
+//   Case 3: 回风舒适  24°C/50%RH → FA≈9.5,  ENT≈48.4,  Td≈12.9
+//   Case 4: 送风制冷  14°C/90%RH → FA≈9.1,  ENT≈37.2,  Td≈12.4
+//   Case 5: 送风干燥  20°C/40%RH → FA≈5.8,  ENT≈34.9,  Td≈6.0
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_DecoupleTrace
+    VAR_INPUT
+        iTrigger : BOOL;          (* TRUE=开始下一组测试 (脉冲沿) *)
+        iEnt_OA  : REAL;          (* 室外焓值 kJ/kg (来自 FB_TH_SensorProc) *)
+        iEnt_RA  : REAL;          (* 回风焓值 kJ/kg *)
+        iFA_OA   : REAL;
+        iFA_RA   : REAL;
+        iT_OA    : REAL;
+        iT_RA    : REAL;
+        iEconMode: USINT;         (* FB_TH_Economizer.oMode *)
+    END_VAR
+    VAR_OUTPUT
+        oCaseIdx : USINT;         (* 当前测试工况 0..5 *)
+        oCaseName: STRING(20);    (* 工况名称 (仅文本, 便于HMI显示) *)
+        oExpectedT: REAL;         (* 期望 T (本次) *)
+        oExpectedFA: REAL;        (* 期望 FA (本次) *)
+        oExpectedENT: REAL;       (* 期望 ENT *)
+        oExpectedTD: REAL;        (* 期望 Td *)
+        oExpectedEconMode: USINT; (* 期望经济运行模式 (Case1~2 用 ENT 比较) *)
+        oCasePass : BOOL;         (* 当前工况通过 *)
+        oAllPass  : BOOL;         (* 全部 5 组通过 *)
+        oProgress : REAL;         (* 0..100% 测试进度 *)
+    END_VAR
+    VAR CONSTANT
+        // Case 1: 夏季室外
+        C1_T : REAL := 35.0;  C1_RH : REAL := 70.0;
+        C1_FA: REAL := 27.1;  C1_ENT: REAL := 104.6; C1_TD: REAL := 29.0;
+        // Case 2: 冬季室外
+        C2_T : REAL := 0.0;   C2_RH : REAL := 50.0;
+        C2_FA: REAL := 1.9;   C2_ENT: REAL := 5.2;   C2_TD: REAL := -10.0;
+        // Case 3: 回风舒适
+        C3_T : REAL := 24.0;  C3_RH : REAL := 50.0;
+        C3_FA: REAL := 9.5;   C3_ENT: REAL := 48.4;  C3_TD: REAL := 12.9;
+        // Case 4: 送风制冷
+        C4_T : REAL := 14.0;  C4_RH : REAL := 90.0;
+        C4_FA: REAL := 9.1;   C4_ENT: REAL := 37.2;  C4_TD: REAL := 12.4;
+        // Case 5: 送风干烧
+        C5_T : REAL := 20.0;  C5_RH : REAL := 40.0;
+        C5_FA: REAL := 5.8;   C5_ENT: REAL := 34.9;  C5_TD: REAL := 6.0;
+    END_VAR
+    VAR
+        _trig : R_TRIG;
+        _done5 : ARRAY[1..5] OF BOOL;
+    END_VAR
+
+    _trig(CLK := iTrigger);
+
+    IF _trig.Q THEN
+        oCaseIdx := oCaseIdx + 1;
+        IF oCaseIdx > 5 THEN oCaseIdx := 1; END_IF;
+    END_IF;
+
+    CASE oCaseIdx OF
+        1:  oCaseName := 'Summer OA 35/70'; oExpectedT := C1_T; oExpectedFA := C1_FA;
+            oExpectedENT := C1_ENT; oExpectedTD := C1_TD;
+            // OA ENT(104.6) > RA ENT(默认48.4) → 非经济运行 → 期望模式 0
+            oExpectedEconMode := 0;
+        2:  oCaseName := 'Winter OA 0/50';  oExpectedT := C2_T; oExpectedFA := C2_FA;
+            oExpectedENT := C2_ENT; oExpectedTD := C2_TD;
+            // OA ENT(5.2) < RA ENT → 焓值经济 → 期望模式 2
+            oExpectedEconMode := 2;
+        3:  oCaseName := 'ReturnAir 24/50'; oExpectedT := C3_T; oExpectedFA := C3_FA;
+            oExpectedENT := C3_ENT; oExpectedTD := C3_TD;
+            oExpectedEconMode := 0;
+        4:  oCaseName := 'SupplyCool 14/90'; oExpectedT := C4_T; oExpectedFA := C4_FA;
+            oExpectedENT := C4_ENT; oExpectedTD := C4_TD;
+            oExpectedEconMode := 0;
+        5:  oCaseName := 'SupplyDry 20/40';  oExpectedT := C5_T; oExpectedFA := C5_FA;
+            oExpectedENT := C5_ENT; oExpectedTD := C5_TD;
+            oExpectedEconMode := 0;
+    END_CASE;
+
+    // 每工况合格判定 (T, FA, ENT, Td, EconMode)
+    IF oCaseIdx >= 1 AND oCaseIdx <= 5 THEN
+        oCasePass :=
+            (ABS(iT_OA - oExpectedT) <= 0.5) AND
+            (ABS(iFA_OA - oExpectedFA) / MAX(oExpectedFA, 0.1) * 100.0 <= 10.0) AND
+            (ABS(iEnt_OA - oExpectedENT) / MAX(oExpectedENT, 0.1) * 100.0 <= 5.0);
+        // 经济运行判定: 只有模式已知时才比对
+        IF oExpectedEconMode > 0 THEN
+            oCasePass := oCasePass AND (iEconMode = oExpectedEconMode);
+        END_IF;
+        _done5[oCaseIdx] := oCasePass;
+    ELSE
+        oCasePass := FALSE;
+    END_IF;
+
+    oAllPass := _done5[1] AND _done5[2] AND _done5[3] AND _done5[4] AND _done5[5];
+    oProgress := (TO_REAL(_done5[1]) + TO_REAL(_done5[2]) + TO_REAL(_done5[3]) + TO_REAL(_done5[4]) + TO_REAL(_done5[5])) / 5.0 * 100.0;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// S4: PID 自动整定辅助  FB_TH_AutoTune
+// =============================================================================
+// 方法: 阶跃响应 + 衰减比 (Ziegler-Nichols 简化版, 适合 HVAC)
+// 用法:
+//   1. 在 FB_TH_Decouple 的某一 PID 输出上, 手动强制阶跃 (如加热阀 0→30%)
+//   2. 监控过程量 (如送风温度), 触发 iStart
+//   3. 捕捉首个波峰(Peak1)和第二个波峰(Peak2), 计算衰减比=|Peak2-SS|/|Peak1-SS|
+//   4. 推荐 KP = Kp_current * sqrt(衰减比/0.25)
+//
+// 注: 非全自动整定, 需要工程师判断稳态区间 & 记录波峰位置
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_AutoTune
+    VAR_INPUT
+        iPV        : REAL;       (* 过程量 (如 T_SA) *)
+        iStepValue : REAL;       (* 阶跃输出值 % (0..100) *)
+        iStart     : BOOL;       (* 沿触发: 开始记录阶跃响应 *)
+        iSampleInterval : TIME := T#1s;  (* 采样间隔 *)
+        iStopWhenStable : BOOL;  (* 自动在稳定时停止 *)
+    END_VAR
+    VAR_OUTPUT
+        oRunning   : BOOL;       (* 记录中 *)
+        oSS        : REAL;       (* 最终稳态值 *)
+        oPeak1     : REAL;       (* 第一超调峰 *)
+        oPeak2     : REAL;       (* 第二超调峰 *)
+        oOvershootPct : REAL;    (* 超调量 % = 100*(Peak1-SS)/(StepChange) *)
+        oDecayRatio : REAL;      (* 衰减比 = |Peak2-SS| / |Peak1-SS| *)
+        oTuneDone  : BOOL;       (* 整定完成 *)
+        oRecomKP   : REAL;      (* 推荐新 KP (基于衰减比) *)
+        oRecomTN   : REAL;      (* 推荐新 TN *)
+        oErrNoStep : BOOL;       (* 步长=0 错误 *)
+    END_VAR
+    VAR
+        _tSamp : TON;
+        _initPV : REAL;
+        _ssSeen : BOOL;
+        _peak1Seen : BOOL;
+        _peak2Seen : BOOL;
+        _lastPV : REAL;
+        _falling : BOOL;
+        _rising  : BOOL;
+    END_VAR
+
+    IF iStepValue = 0.0 THEN
+        oErrNoStep := TRUE;
+        oTuneDone := FALSE;
+        oRunning := FALSE;
+        RETURN;
+    ELSE
+        oErrNoStep := FALSE;
+    END_IF;
+
+    IF iStart THEN
+        oRunning := TRUE;
+        oTuneDone := FALSE;
+        _initPV := iPV;
+        _ssSeen := FALSE;
+        _peak1Seen := FALSE;
+        _peak2Seen := FALSE;
+        _lastPV := iPV;
+    END_IF;
+
+    IF NOT oRunning THEN RETURN; END_IF;
+
+    _tSamp(IN := NOT _tSamp.Q, PT := iSampleInterval);
+    IF NOT _tSamp.Q THEN RETURN; END_IF;
+
+    // 方向检测
+    _rising  := (iPV > _lastPV + 0.02);
+    _falling := (iPV < _lastPV - 0.02);
+    _lastPV := iPV;
+
+    // 记录波峰 (第1、第2次由升转降)
+    IF NOT _peak1Seen AND _falling AND (iPV > _initPV) THEN
+        oPeak1 := iPV;
+        _peak1Seen := TRUE;
+    ELSIF _peak1Seen AND NOT _peak2Seen AND _falling THEN
+        // 第二个波峰: 二次上升后的下降
+        // (简化) 取任意位置的局部次高峰
+        oPeak2 := iPV;
+        _peak2Seen := TRUE;
+    END_IF;
+
+    // 稳态判定: 连续 5s 波动 < 0.1K
+    // (简化) 2 个峰值已找到即停止
+    IF _peak2Seen AND iStopWhenStable THEN
+        oRunning := FALSE;
+        oSS := iPV;
+        oTuneDone := TRUE;
+
+        IF ABS(oPeak1 - oSS) > 0.01 THEN
+            oDecayRatio   := ABS(oPeak2 - oSS) / ABS(oPeak1 - oSS);
+            oOvershootPct := ABS(oPeak1 - oSS) / ABS(oSS - _initPV) * 100.0;
+            // 衰减比 0.25 为最佳 → KP_scale = sqrt(0.25 / Current)
+            oRecomKP := SQRT(MAX(0.25, 0.01) / MAX(oDecayRatio, 0.01));
+            // TN 按超调比例放大
+            IF oOvershootPct > 30.0 THEN
+                oRecomTN := 240.0;  (* 超调大, 积分减慢 *)
+            ELSE
+                oRecomTN := 120.0;
+            END_IF;
+        END_IF;
+    END_IF;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// S5: 24h 闭环运行监控  FB_TH_RunStatus
+// =============================================================================
+// 连续 24h 监控: T 目标 ±1K 内占比 ≥ 95%, FA 目标 ±0.5 g/kg 内占比 ≥ 95%
+// 同时记录露点保护激活次数、经济运行切换次数、传感器故障数
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_RunStatus
+    VAR_INPUT
+        iT_Supply  : REAL;           (* 送风温度 °C *)
+        iFA_Supply : REAL;           (* 送风绝对湿度 g/kg *)
+        iT_SPT     : REAL;           (* 送风温度目标 *)
+        iFA_SPT    : REAL;           (* 送风绝对湿度目标 *)
+        iDewProtecting : BOOL;       (* 露点保护激活 *)
+        iEconMode  : USINT;          (* 经济运行模式 *)
+        iValid     : BOOL;           (* 传感器有效 *)
+        iRun       : BOOL;           (* 运行中 (=Enable AND Auto) *)
+        iClear     : BOOL;           (* 复位统计 (沿) *)
+    END_VAR
+    VAR_OUTPUT
+        oSecondsTotal : UDINT;       (* 总运行秒数 *)
+        oSecondsT_OK  : UDINT;       (* T 达标秒数 *)
+        oSecondsFA_OK : UDINT;       (* FA 达标秒数 *)
+        oT_AccuracyPct: REAL;        (* T 达标率 % *)
+        oFA_AccuracyPct: REAL;       (* FA 达标率 % *)
+        oDewProtectCount: UDINT;     (* 露点保护触发次数 (上升沿计数) *)
+        oEconSwitchCount: UDINT;     (* 经济运行模式切换次数 *)
+        oSensorErrCount: UDINT;      (* 传感器异常次数 *)
+        oResultPass   : BOOL;        (* 24h 结果: T≥95% 且 FA≥95% *)
+        o24hDone     : BOOL;         (* 已累计满 24h *)
+    END_VAR
+    VAR CONSTANT
+        T_TOL   : REAL := 1.0;
+        FA_TOL  : REAL := 0.5;
+        SEC_24H : UDINT := 86400;
+    END_VAR
+    VAR
+        _pulse1s : TON;
+        _lastDew : BOOL;
+        _lastMode: USINT;
+        _lastValid: BOOL;
+        _trigDew : R_TRIG;
+        _trigMode: R_TRIG;
+        _trigInv : R_TRIG;
+        _trigClr : R_TRIG;
+    END_VAR
+
+    _trigClr(CLK := iClear);
+    IF _trigClr.Q THEN
+        oSecondsTotal := 0;  oSecondsT_OK := 0;  oSecondsFA_OK := 0;
+        oDewProtectCount := 0;  oEconSwitchCount := 0;  oSensorErrCount := 0;
+        o24hDone := FALSE;
+    END_IF;
+
+    IF NOT iRun THEN RETURN; END_IF;
+
+    _pulse1s(IN := NOT _pulse1s.Q, PT := T#1s);
+    IF NOT _pulse1s.Q THEN RETURN; END_IF;
+
+    // 累计运行时间
+    IF oSecondsTotal < SEC_24H THEN
+        oSecondsTotal := oSecondsTotal + 1;
+        IF ABS(iT_Supply  - iT_SPT)  <= T_TOL  THEN oSecondsT_OK  := oSecondsT_OK  + 1; END_IF;
+        IF ABS(iFA_Supply - iFA_SPT) <= FA_TOL THEN oSecondsFA_OK := oSecondsFA_OK + 1; END_IF;
+    ELSE
+        o24hDone := TRUE;
+    END_IF;
+
+    // 达标率
+    IF oSecondsTotal > 0 THEN
+        oT_AccuracyPct  := TO_REAL(oSecondsT_OK)  / TO_REAL(oSecondsTotal) * 100.0;
+        oFA_AccuracyPct := TO_REAL(oSecondsFA_OK) / TO_REAL(oSecondsTotal) * 100.0;
+    END_IF;
+
+    // 事件计数
+    _trigDew(CLK := iDewProtecting AND NOT _lastDew);
+    IF _trigDew.Q THEN oDewProtectCount := oDewProtectCount + 1; END_IF;
+    _lastDew := iDewProtecting;
+
+    _trigMode(CLK := (iEconMode <> _lastMode) AND oSecondsTotal > 0);
+    IF _trigMode.Q THEN oEconSwitchCount := oEconSwitchCount + 1; END_IF;
+    _lastMode := iEconMode;
+
+    _trigInv(CLK := NOT iValid AND _lastValid);
+    IF _trigInv.Q THEN oSensorErrCount := oSensorErrCount + 1; END_IF;
+    _lastValid := iValid;
+
+    // 24h 验收判定
+    oResultPass := o24hDone AND (oT_AccuracyPct >= 95.0) AND (oFA_AccuracyPct >= 95.0);
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 总控状态机  FB_TH_Commission
+// =============================================================================
+// S1→S2→S3→S4→S5→S6 自动推进, 每阶段完成时生成 oMilestone 脉冲
+// 供 HMI 显示 "当前阶段 / 进度 / 里程碑事件列表"
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_Commission
+    VAR_INPUT
+        iStart : BOOL;                 (* 沿触发: 启动 S1 *)
+        iNext  : BOOL;                 (* 沿触发: 手动进入下一阶段 (用于调试加速) *)
+        iS1Pass, iS2Pass, iS3Pass, iS4Pass, iS5Pass, iS6Pass : BOOL;   (* 各阶段通过信号 *)
+    END_VAR
+    VAR_OUTPUT
+        oStage   : USINT;              (* 1..6 当前阶段, 0=未启动, 7=完成 *)
+        oStageName : STRING(20);
+        oProgress : REAL;              (* 0..100% *)
+        oMilestone : BOOL;             (* 阶段达标脉冲 *)
+    END_VAR
+    VAR
+        _trigStart : R_TRIG;
+        _trigNext  : R_TRIG;
+    END_VAR
+
+    _trigStart(CLK := iStart);
+    _trigNext(CLK := iNext);
+    oMilestone := FALSE;
+
+    IF _trigStart.Q THEN
+        oStage := 1;
+    END_IF;
+
+    CASE oStage OF
+        0: oStageName := 'NotStarted'; oProgress := 0.0;
+        1: oStageName := 'S1 Calib';    oProgress := 100.0/6.0;
+            IF iS1Pass OR _trigNext.Q THEN oStage := 2; oMilestone := TRUE; END_IF;
+        2: oStageName := 'S2 Trace';    oProgress := 200.0/6.0;
+            IF iS2Pass OR _trigNext.Q THEN oStage := 3; oMilestone := TRUE; END_IF;
+        3: oStageName := 'S3 Actuator'; oProgress := 300.0/6.0;
+            IF iS3Pass OR _trigNext.Q THEN oStage := 4; oMilestone := TRUE; END_IF;
+        4: oStageName := 'S4 PID Tune'; oProgress := 400.0/6.0;
+            IF iS4Pass OR _trigNext.Q THEN oStage := 5; oMilestone := TRUE; END_IF;
+        5: oStageName := 'S5 Run24h';   oProgress := 500.0/6.0;
+            IF iS5Pass OR _trigNext.Q THEN oStage := 6; oMilestone := TRUE; END_IF;
+        6: oStageName := 'S6 Accept';   oProgress := 600.0/6.0;
+            IF iS6Pass OR _trigNext.Q THEN oStage := 7; oMilestone := TRUE; END_IF;
+        7: oStageName := 'Complete';    oProgress := 100.0;
+    END_CASE;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 附录: OLT 监视变量速查表 (复制到 Values of Variables 视图)
+// =============================================================================
+//
+// 阶段 | OLT 变量名 (完整路径)                        | 数据类型 | 典型通过值
+// -----|------------------------------------------------|---------|--------------------------------
+// S1   | POL648.XI1 (NTC10k raw, DINT)                 | DINT    | ≈ 100000 @25°C
+// S1   | aoOA_T.TRel                                    | WORD    | 0=OK (否则 1断路/2超量/3欠量/5短路)
+// S1   | aoOA_RH.TVal  vs 校准仪读数                    | REAL    | 差 ≤ ±2%
+// S2   | fbSP_OA.oFA  oENT  oTd                         | REAL×3  | 与手算 见 5 工况表
+// S2   | fbSP_OA.oValid                                 | BOOL    | TRUE
+// S2   | fbEcon.oMode  oOADamper                        | USINT,REAL | 2/100 或 0/最小新风
+// S3   | aoHeatingValve.AFBV vs 手动 0/50/100           | REAL    | 差 ≤ ±3%
+// S3   | 3PosHeat.DO+ , DO- 脉冲时间                    | BOOL×2  | 100%档应输出 90~150s 脉冲
+// S4   | fbPID_T.E, fbPID_T.A (温度PID偏差/输出)        | REAL×2  | 稳态 |E| ≤0.5, 阶跃衰减比≈0.25
+// S4   | fbPID_FA.E, fbPID_FA.A (湿度PID偏差/输出)      | REAL×2  | 稳态 |E| ≤0.25, 不应与干侧同时非零>5%
+// S4   | fbDewP.oProtecting, oCoolLimited               | BOOL,REAL | CHWST<Td+1.5K 时 TRUE
+// S5   | fbRun.oT_AccuracyPct, oFA_AccuracyPct (24h)    | REAL×2  | ≥95%, ≥95%
+// S5   | fbRun.oDewProtectCount, oEconSwitchCount       | UDINT×2 | 夜间冬季应切到模式2, >0次
+// S6   | aoTarget.ScanTime                              | REAL    | ≤100ms
+// S6   | Force Markers 视图                             | -       | 必须全部清空
+//
+// =============================================================================

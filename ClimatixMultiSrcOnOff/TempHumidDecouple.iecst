@@ -1,0 +1,571 @@
+// =============================================================================
+// 温湿度解耦控制库  TempHumidDecouple.iecst
+// 适用控制器: C200/C400/C500/C600/S300/S400 (Climatix Project Studio)
+// 编程语言: IEC 61131-3 ST
+// 版本: v1.0  日期: 2026-08-27
+//
+// 设计依据:
+//   - references/hvac-advanced.md §1 ABSHumidity / §2 Enthalpy / §4 级联控制
+//   - references/climatix-fb-library.md §4.2.1 PIDT1 / §4.4.1 ABSHumidity / §4.4.2 Enthalpy
+//   - references/automation-objects.md aoCascLeadCtlrEx (双独立 SP)
+//
+// 核心思路:
+//   温度与相对湿度 RH 存在物理耦合: 加热/冷却改变 T 时 RH 跟随变化,
+//   但绝对湿度 FA (g/kg) 不变 → 用 FA 作为湿度 PID 的过程量实现解耦
+//
+// 提供:
+//   1. FB_DewPoint      —— 露点温度计算 (Magnus 公式, 防冷凝保护)
+//   2. FB_TH_SensorProc —— T+RH 传感器处理: 输出 T / FA / ENT / Td
+//   3. FB_TH_Decouple   —— 温湿度双独立 PID (温度控干侧, FA控湿侧)
+//   4. FB_TH_Economizer —— 焓值经济运行 (含 4 种模式选择)
+//   5. FB_TH_Master     —— 主控组合: 解耦PID + 经济运行 + 露点保护 + 级联SP
+// =============================================================================
+
+
+// =============================================================================
+// 1. 露点温度计算  FB_DewPoint (Magnus 公式)
+// =============================================================================
+// 公式: α = ln(RH/100) + a*T/(b+T) ; Td = b*α / (a-α)
+//   a = 17.27, b = 237.7 °C (Magnus-Tetens 系数, 0..60°C 范围精度 ±0.4K)
+// 用途:
+//   - 防冷凝保护: 冷盘管表面温度 > 露点 + 安全裕度
+//   - 冷却盘管供水温度下限 = Td + ΔT_safe
+//   - 判断是否需要后加热 (再热除湿场景)
+// =============================================================================
+
+FUNCTION_BLOCK FB_DewPoint
+    VAR_INPUT
+        iT  : REAL;   (* 干球温度 °C, 0..60 *)
+        iRH : REAL;   (* 相对湿度 %, 1..100 *)
+    END_VAR
+    VAR_OUTPUT
+        oTd : REAL;   (* 露点温度 °C *)
+        oOK : BOOL;   (* 计算有效 (输入在范围内) *)
+    END_VAR
+    VAR CONSTANT
+        _a : REAL := 17.27;
+        _b : REAL := 237.7;
+    END_VAR
+    VAR
+        _alpha : REAL;
+    END_VAR
+
+    IF (iT >= 0.0) AND (iT <= 60.0) AND (iRH > 0.0) AND (iRH <= 100.0) THEN
+        // 防止 ln(0): 限幅 RH 到 0.1%
+        _alpha := LN(MAX(iRH, 0.1) / 100.0) + (_a * iT) / (_b + iT);
+        oTd := (_b * _alpha) / (_a - _alpha);
+        oOK := TRUE;
+    ELSE
+        oTd := 0.0;
+        oOK := FALSE;
+    END_IF;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 2. T+RH 传感器处理  FB_TH_SensorProc
+// =============================================================================
+// 链路: T(°C)+RH(%) --[ABSHumidity]--> FA(g/kg) --[Enthalpy]+T(K)--> ENT(kJ/kg)
+//                              同时 --> [FB_DewPoint] --> Td(°C)
+// 输入级故障处理: ER=TRUE 时输出保持上一周期值, 触发上层降级
+//
+// 注: Enthalpy FB 的 T 单位为 K, 必须做 +273.15 转换
+//     ABSHumidity 限制 T ≤ 50°C, 超出时 FA 无效 (这里也做范围检查)
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_SensorProc
+    VAR_INPUT
+        iT   : REAL;    (* 温度 °C *)
+        iRH  : REAL;    (* 相对湿度 % *)
+        iER  : BOOL;    (* 传感器故障 (温度或湿度任一故障) *)
+    END_VAR
+    VAR_OUTPUT
+        oT   : REAL;    (* 温度 °C *)
+        oFA  : REAL;    (* 绝对湿度 g/kg *)
+        oENT : REAL;    (* 焓值 kJ/kg *)
+        oTd  : REAL;    (* 露点 °C *)
+        oValid : BOOL;  (* 数据有效 *)
+    END_VAR
+    VAR
+        fbAbsH  : ABSHumidity;
+        fbEnth  : Enthalpy;
+        fbDew   : FB_DewPoint;
+        _lastT  : REAL;
+        _lastFA : REAL;
+        _lastEnt: REAL;
+        _lastTd : REAL;
+    END_VAR
+
+    IF NOT iER AND (iT >= -50.0) AND (iT <= 50.0) AND (iRH >= 0.0) AND (iRH <= 100.0) THEN
+        // Step 1: RH → FA (T ≤ 50°C 限制已检查)
+        fbAbsH(T := iT, F := iRH);
+        oFA := fbAbsH.FA;
+
+        // Step 2: FA + T(K) → ENT
+        fbEnth(T := iT + 273.15, FA := oFA);
+        oENT := fbEnth.ENT;
+
+        // Step 3: T + RH → Td (露点)
+        fbDew(iT := iT, iRH := iRH);
+        oTd := fbDew.oTd;
+
+        // 输出
+        oT := iT;
+        oValid := TRUE;
+        // 缓存
+        _lastT  := oT;  _lastFA := oFA;  _lastEnt := oENT;  _lastTd := oTd;
+    ELSE
+        // 故障保持上一周期值 (避免下游 PID 振荡)
+        oT     := _lastT;
+        oFA    := _lastFA;
+        oENT   := _lastEnt;
+        oTd    := _lastTd;
+        oValid := FALSE;
+    END_IF;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 3. 温湿度解耦双 PID  FB_TH_Decouple
+// =============================================================================
+// 核心: 用 FA (绝对湿度) 而非 RH 作为湿度控制目标
+//   - 温度 PID: 控制加热盘管 / 冷盘管干侧 (送风温度)
+//   - 湿度 PID: 控制冷盘管湿侧 (除湿) / 加湿器 (加湿)
+//   - 两个 PID 物理上独立: 温度变化不改变 FA, 湿度 PID 不被错误激励
+//
+// 输出分离:
+//   oHeatValve   → 热盘管阀 0..100% (KP > 0 加热作用)
+//   oCoolValveDry → 冷盘管干侧 (温度冷却) 0..100% (KP < 0 冷却作用)
+//   oCoolValveWet → 冷盘管湿侧 (深度除湿, 降温至露点以下) 0..100%
+//   oHumidCmd    → 加湿器 0..100% (KP > 0 加湿作用)
+//
+// 解耦机制:
+//   1. 干球温度 PID 控干侧盘管 → 仅调温度不调湿度
+//   2. 绝对湿度 PID 控湿侧盘管 → 仅调湿度
+//      - FA > SP → 需要除湿: 冷盘管湿侧开 (冷凝), 同时温度会下降
+//      - FA < SP → 需要加湿: 加湿器开
+//   3. 干侧 PID 自动补偿湿侧除湿带来的温度下降 → 实现"再热除湿"无独立再热盘管
+//   4. 死区 (DeadBand) 防止温/湿 PID 同时动作震荡
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_Decouple
+    VAR_INPUT
+        // 过程量
+        iT_Supply   : REAL;     (* 送风温度 °C (温度PID反馈) *)
+        iFA_Supply  : REAL;     (* 送风绝对湿度 g/kg (湿度PID反馈) *)
+        // 设定值
+        iSP_T       : REAL;     (* 送风温度设定值 °C *)
+        iSP_FA      : REAL;     (* 送风绝对湿度设定值 g/kg (典型 8.0~10.0) *)
+        // 死区
+        iDB_T       : REAL := 1.0;   (* 温度死区 K *)
+        iDB_FA      : REAL := 0.5;   (* 湿度死区 g/kg *)
+        // PID 参数
+        iKP_T       : REAL := 5.0;   (* 温度 PID 比例 *)
+        iTN_T       : REAL := 120.0; (* 温度 PID 积分时间 s *)
+        iKP_FA      : REAL := 3.0;   (* 湿度 PID 比例 *)
+        iTN_FA      : REAL := 180.0; (* 湿度 PID 积分时间 s *)
+        // 使能
+        iEnable     : BOOL;
+        iAuto       : BOOL;     (* TRUE=自动 FALSE=手动 *)
+        iManualHeat : REAL := 0.0;
+        iManualCool : REAL := 0.0;
+        iManualHumid: REAL := 0.0;
+    END_VAR
+    VAR_OUTPUT
+        oHeatValve   : REAL;   (* 0..100% 加热盘管 *)
+        oCoolDry     : REAL;   (* 0..100% 冷盘管干侧 (温度冷却) *)
+        oCoolWet     : REAL;   (* 0..100% 冷盘管湿侧 (除湿) *)
+        oHumidCmd    : REAL;   (* 0..100% 加湿器 *)
+        oBO_T        : BOOL;   (* 温度 PID 输出饱和上限 *)
+        oBU_T        : BOOL;   (* 温度 PID 输出饱和下限 *)
+    END_VAR
+    VAR
+        fbPID_T      : PIDT1;     (* 温度 PID *)
+        fbPID_FA     : PIDT1;     (* 绝对湿度 PID *)
+        _errT        : REAL;
+        _errFA       : REAL;
+        _inDB_T      : BOOL;
+        _inDB_FA     : BOOL;
+    END_VAR
+
+    // ---- 计算偏差并死区检查 ----
+    _errT  := iSP_T  - iT_Supply;   (* 温度 SP - PV *)
+    _errFA := iSP_FA - iFA_Supply;  (* 绝对湿度 SP - PV *)
+    _inDB_T  := (ABS(_errT)  <= iDB_T);
+    _inDB_FA := (ABS(_errFA) <= iDB_FA);
+
+    // ---- 温度 PID (控制加热/冷却干侧) ----
+    // 偏差 > 0 → 需要加热; 偏差 < 0 → 需要冷却
+    // 输出 0..100% 拆为加热支路 (>0) 和冷却支路 (<0)
+    fbPID_T(
+        E     := _errT,
+        kp    := iKP_T,
+        kv    := 0.0,                  (* 温度回路一般不用微分 *)
+        T1    := 0.0,
+        TN    := iTN_T,
+        YHand := iManualHeat,
+        Auto  := iAuto AND iEnable AND NOT _inDB_T,
+        BwO   := 100.0,
+        BwU   := -100.0                (* 允许负输出, 表示冷却 *)
+    );
+    oBO_T := fbPID_T.BO;
+    oBU_T := fbPID_T.BU;
+
+    // 拆分加热/冷却支路 (输出范围 -100..+100)
+    IF fbPID_T.A > 0.0 THEN
+        oHeatValve := fbPID_T.A;          (* 加热 *)
+        oCoolDry   := 0.0;
+    ELSE
+        oHeatValve := 0.0;
+        oCoolDry   := -fbPID_T.A;        (* 冷却干侧, 取绝对值 *)
+    END_IF;
+
+    // ---- 绝对湿度 PID (控制冷盘湿侧除湿 / 加湿器) ----
+    // 偏差 > 0 → FA 偏低, 需要加湿
+    // 偏差 < 0 → FA 偏高, 需要除湿 (开冷盘湿侧冷凝除湿)
+    fbPID_FA(
+        E     := _errFA,
+        kp    := iKP_FA,
+        kv    := 0.0,
+        T1    := 0.0,
+        TN    := iTN_FA,
+        YHand := iManualHumid,
+        Auto  := iAuto AND iEnable AND NOT _inDB_FA,
+        BwO   := 100.0,
+        BwU   := -100.0
+    );
+
+    IF fbPID_FA.A > 0.0 THEN
+        // FA 低于设定值 → 加湿
+        oHumidCmd := fbPID_FA.A;
+        oCoolWet  := 0.0;
+    ELSE
+        // FA 高于设定值 → 冷凝除湿 (冷盘湿侧开)
+        oHumidCmd := 0.0;
+        oCoolWet  := -fbPID_FA.A;
+    END_IF;
+
+    // ---- 手动模式透传 ----
+    IF NOT iAuto OR NOT iEnable THEN
+        oHeatValve := iManualHeat;
+        oCoolDry   := iManualCool;
+        oHumidCmd := iManualHumid;
+        oCoolWet  := 0.0;
+    END_IF;
+
+    // 输出限幅
+    oHeatValve := LIMIT(IN := oHeatValve, MN := 0.0, MX := 100.0);
+    oCoolDry   := LIMIT(IN := oCoolDry,   MN := 0.0, MX := 100.0);
+    oCoolWet   := LIMIT(IN := oCoolWet,   MN := 0.0, MX := 100.0);
+    oHumidCmd  := LIMIT(IN := oHumidCmd,  MN := 0.0, MX := 100.0);
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 4. 焓值经济运行  FB_TH_Economizer
+// =============================================================================
+// 4 种模式选择 (优先级从高到低):
+//   2 = 焓值经济: ENT_OA < ENT_RA     (室外焓值低于回风 → 全新风自由冷却)
+//   3 = 干燥经济: FA_OA < FA_RA        (室外绝对湿度低于回风 → 利用新风除湿)
+//   1 = 温度经济: T_OA < T_RA          (室外温度低于回风 → 仅温度获益)
+//   0 = 最小新风: 上述都不满足        (回风为主, 最小新风满足卫生要求)
+//
+// 输出: 新风阀开度 (0..100%), 排风阀开度, 回风阀开度 (互补)
+//
+// 与 hvac-advanced.md §2.5 一致, 用焓值而非温度作判据, 综合考虑温湿度
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_Economizer
+    VAR_INPUT
+        iENT_OA : REAL;   (* 室外焓值 kJ/kg *)
+        iENT_RA : REAL;   (* 回风焓值 kJ/kg *)
+        iFA_OA  : REAL;   (* 室外绝对湿度 g/kg *)
+        iFA_RA  : REAL;   (* 回风绝对湿度 g/kg *)
+        iT_OA   : REAL;   (* 室外温度 °C *)
+        iT_RA   : REAL;   (* 回风温度 °C *)
+        iEnable : BOOL;
+        iT_OA_Min: REAL := 5.0;  (* 室外温度低限, 低于此值不能全新风 (防冻) *)
+        iMinOAPercent : REAL := 10.0;  (* 最小新风比 0..100% *)
+    END_VAR
+    VAR_OUTPUT
+        oOADamper : REAL;   (* 新风阀开度 0..100% *)
+        oEADamper : REAL;   (* 排风阀开度 0..100% *)
+        oRADamper : REAL;   (* 回风阀开度 0..100% (与新风互补) *)
+        oMode     : USINT;  (* 0=最小新风 1=温度经济 2=焓值经济 3=干燥经济 *)
+    END_VAR
+    VAR
+        _bEnthEcon : BOOL;
+        _bDryEcon  : BOOL;
+        _bTempEcon : BOOL;
+    END_VAR
+
+    IF NOT iEnable THEN
+        // 关闭经济运行 → 最小新风
+        oOADamper := iMinOAPercent;
+        oEADamper := iMinOAPercent;
+        oRADamper := 100.0 - iMinOAPercent;
+        oMode := 0;
+        RETURN;
+    END_IF;
+
+    // 室外温度低于低限 → 不能全新风 (防冻)
+    IF iT_OA < iT_OA_Min THEN
+        oOADamper := iMinOAPercent;
+        oEADamper := iMinOAPercent;
+        oRADamper := 100.0 - iMinOAPercent;
+        oMode := 0;
+        RETURN;
+    END_IF;
+
+    // 4 种模式判别
+    _bEnthEcon := (iENT_OA < iENT_RA);
+    _bDryEcon  := (iFA_OA  < iFA_RA)  AND NOT _bEnthEcon;
+    _bTempEcon := (iT_OA   < iT_RA)   AND NOT _bEnthEcon AND NOT _bDryEcon;
+
+    IF _bEnthEcon THEN
+        oMode := 2;
+    ELSIF _bDryEcon THEN
+        oMode := 3;
+    ELSIF _bTempEcon THEN
+        oMode := 1;
+    ELSE
+        oMode := 0;
+    END_IF;
+
+    // 阀位输出 (模式 1/2/3 全新风; 模式 0 最小新风)
+    IF oMode > 0 THEN
+        oOADamper := 100.0;
+        oEADamper := 100.0;
+        oRADamper := 0.0;
+    ELSE
+        oOADamper := iMinOAPercent;
+        oEADamper := iMinOAPercent;
+        oRADamper := 100.0 - iMinOAPercent;
+    END_IF;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 5. 露点防冷凝保护  FB_DewPointProtect
+// =============================================================================
+// 防止冷盘管表面温度低于露点 → 避免冷凝水在管壁外 (而非盘管内) 形成
+// 策略: 冷盘管供水温度下限 = Td + ΔT_safe
+//       若 PID 输出请求冷却但供水温度低于下限 → 限制冷却输出
+// =============================================================================
+
+FUNCTION_BLOCK FB_DewPointProtect
+    VAR_INPUT
+        iTd       : REAL;    (* 露点温度 °C *)
+        iCHWST    : REAL;    (* 冷冻水供水温度 °C (盘管入口水温) *)
+        iCoolCmd  : REAL;    (* 冷却 PID 输出 0..100% *)
+        iSafeMargin : REAL := 1.5;  (* 安全裕度 K *)
+    END_VAR
+    VAR_OUTPUT
+        oCoolLimited : REAL;   (* 限幅后的冷却输出 0..100% *)
+        oProtecting  : BOOL;   (* 防冷凝保护激活 *)
+        oCHWST_Min   : REAL;   (* 计算的供水温度下限 *)
+    END_VAR
+
+    // 供水温度下限 = 露点 + 安全裕度
+    oCHWST_Min := iTd + iSafeMargin;
+
+    // 若供水温度低于下限 → 冷却输出限幅 (避免继续降温到露点)
+    IF iCHWST < oCHWST_Min THEN
+        // 比例限幅: 越低于下限, 限幅越严
+        oProtecting := TRUE;
+        // 简化策略: 当供水温度 < 下限时, 冷却输出按比例衰减
+        IF (oCHWST_Min - iCHWST) > 2.0 THEN
+            oCoolLimited := 0.0;        (* 严重低于下限 → 强制关冷却 *)
+        ELSE
+            oCoolLimited := iCoolCmd * (1.0 - (oCHWST_Min - iCHWST) / 2.0);
+        END_IF;
+    ELSE
+        oProtecting := FALSE;
+        oCoolLimited := iCoolCmd;
+    END_IF;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 6. 主控组合  FB_TH_Master
+// =============================================================================
+// 完整 AHU 温湿度控制组合:
+//   传感器处理 → 解耦 PID → 露点保护 → 经济运行 → 输出
+//
+// 调用顺序 (每个扫描周期):
+//   1. 室外/回风/送风 三组传感器处理 → 得到 T / FA / ENT / Td
+//   2. 焓值经济运行模式决策 → 新风/排风/回风阀位
+//   3. 解耦 PID 计算 → 加热/冷却干侧/冷却湿侧/加湿器
+//   4. 露点保护 → 限幅冷却输出
+//   5. 输出汇总
+// =============================================================================
+
+FUNCTION_BLOCK FB_TH_Master
+    VAR_INPUT
+        // 室外传感器
+        iT_OA, iRH_OA     : REAL;
+        iER_OA            : BOOL;
+        // 回风传感器
+        iT_RA, iRH_RA     : REAL;
+        iER_RA            : BOOL;
+        // 送风传感器
+        iT_SA, iRH_SA     : REAL;
+        iER_SA            : BOOL;
+        // 设定值
+        iSP_T_SA          : REAL := 18.0;   (* 送风温度设定值, 可由上级级联给出 *)
+        iSP_FA_SA         : REAL := 9.0;    (* 送风绝对湿度设定值 g/kg *)
+        // 使能
+        iEnable           : BOOL;
+        iAuto             : BOOL;
+        // 经济运行参数
+        iMinOAPercent     : REAL := 10.0;
+        iT_OA_Min         : REAL := 5.0;
+    END_VAR
+    VAR_OUTPUT
+        // 阀位输出
+        oOADamper         : REAL;   (* 新风阀 *)
+        oEADamper         : REAL;   (* 排风阀 *)
+        oRADamper         : REAL;   (* 回风阀 *)
+        oHeatValve        : REAL;   (* 加热盘管 *)
+        oCoolDry          : REAL;   (* 冷盘干侧 (温度冷却) *)
+        oCoolWet          : REAL;   (* 冷盘湿侧 (除湿) *)
+        oHumidCmd         : REAL;   (* 加湿器 *)
+        // 诊断
+        oEconMode         : USINT;
+        oDewProtecting    : BOOL;
+        oSensorValid      : BOOL;
+        oTd_SA            : REAL;   (* 送风露点, 用于 HMI 显示 *)
+    END_VAR
+    VAR
+        fbSP_OA : FB_TH_SensorProc;
+        fbSP_RA : FB_TH_SensorProc;
+        fbSP_SA : FB_TH_SensorProc;
+        fbEcon  : FB_TH_Economizer;
+        fbPID   : FB_TH_Decouple;
+        fbDewP  : FB_DewPointProtect;
+    END_VAR
+
+    // ---- 1. 传感器处理 ----
+    fbSP_OA(iT := iT_OA,  iRH := iRH_OA,  iER := iER_OA);
+    fbSP_RA(iT := iT_RA,  iRH := iRH_RA,  iER := iER_RA);
+    fbSP_SA(iT := iT_SA,  iRH := iRH_SA,  iER := iER_SA);
+
+    oSensorValid := fbSP_OA.oValid AND fbSP_RA.oValid AND fbSP_SA.oValid;
+    oTd_SA := fbSP_SA.oTd;
+
+    // ---- 2. 焓值经济运行 ----
+    fbEcon(
+        iENT_OA := fbSP_OA.oENT,  iENT_RA := fbSP_RA.oENT,
+        iFA_OA  := fbSP_OA.oFA,   iFA_RA  := fbSP_RA.oFA,
+        iT_OA   := fbSP_OA.oT,    iT_RA   := fbSP_RA.oT,
+        iEnable := iEnable,
+        iT_OA_Min := iT_OA_Min,
+        iMinOAPercent := iMinOAPercent
+    );
+    oOADamper := fbEcon.oOADamper;
+    oEADamper := fbEcon.oEADamper;
+    oRADamper := fbEcon.oRADamper;
+    oEconMode := fbEcon.oMode;
+
+    // ---- 3. 解耦 PID ----
+    fbPID(
+        iT_Supply := fbSP_SA.oT,  iFA_Supply := fbSP_SA.oFA,
+        iSP_T := iSP_T_SA, iSP_FA := iSP_FA_SA,
+        iEnable := iEnable, iAuto := iAuto AND oSensorValid
+    );
+
+    // ---- 4. 露点保护 (限制冷却干侧和湿侧) ----
+    // 干侧: 受送风露点保护
+    fbDewP(iTd := fbSP_SA.oTd, iCHWST := 7.0, iCoolCmd := fbPID.oCoolDry);
+    oCoolDry := fbDewP.oCoolLimited;
+    oDewProtecting := fbDewP.oProtecting;
+    // 湿侧: 本身用于除湿, 需要冷到露点以下, 不参与防冷凝保护
+    oCoolWet := fbPID.oCoolWet;
+
+    // ---- 5. 其他输出透传 ----
+    oHeatValve := fbPID.oHeatValve;
+    oHumidCmd  := fbPID.oHumidCmd;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 7. 应用示例: AHU 级联主控
+// =============================================================================
+// 主控 aoCascLeadCtlrEx: 室温 → 送风温度SP / 送风湿度SP
+// 副控 FB_TH_Master: 按 SP 控制送风温湿度
+// =============================================================================
+
+PROGRAM Pgm_AHU_TH_Control
+    VAR
+        // 主控制器 (室温级联)
+        fbMaster  : FB_TH_Master;
+        // 室温+RH (区域代表点)
+        rRoomT, rRoomRH : REAL;
+        bRoomER        : BOOL;
+        // 室温设定
+        rRoomSPT       : REAL := 24.0;
+        rRoomSPFA      : REAL := 9.5;   (* 室内目标绝对湿度, 对应 ~50%RH@24°C *)
+
+        // 主级联控制器 (用 aoCascLeadCtlrEx 在 Project Studio 实例化)
+        // 简化: 此处用 FB_TH_Master 直接做副控, 主控由外部对象提供
+        // 实际项目应连接 aoCascLeadCtlrEx.SPVH/SPVC → fbMaster.iSP_T_SA
+        //                              aoCascLeadCtlrEx.SPVH_FA → fbMaster.iSP_FA_SA
+    END_VAR
+
+    // 传感器处理与主控组合
+    fbMaster(
+        iT_OA := rOutdoorT, iRH_OA := rOutdoorRH, iER_OA := bErrOA,
+        iT_RA := rReturnT,  iRH_RA := rReturnRH,  iER_RA := bErrRA,
+        iT_SA := rSupplyT,   iRH_SA := rSupplyRH,   iER_SA := bErrSA,
+        iSP_T_SA := rSupplySPT,  // 由主级联控制器提供
+        iSP_FA_SA := rSupplySPFA,
+        iEnable := bSystemEnable,
+        iAuto := bAutoMode
+    );
+
+    // 输出连接到 AO/BO 对象 (略, 见 DevCmdApp.iecst 写入 aoBinaryOutput/aoAnalogOutput 模式)
+    // aoOADA.Val1 := fbMaster.oOADamper;
+    // aoEADA.Val1 := fbMaster.oEADamper;
+    // aoRADA.Val1 := fbMaster.oRADamper;
+    // aoHeatingValve.Val1 := fbMaster.oHeatValve;
+    // aoCoolDryValve.Val1 := fbMaster.oCoolDry;
+    // aoCoolWetValve.Val1 := fbMaster.oCoolWet;
+    // aoHumidifier.Val1 := fbMaster.oHumidCmd;
+END_PROGRAM
+
+
+// =============================================================================
+// 算法选型与传感器清单 (汇总)
+// =============================================================================
+//
+// 算法层 | 解决什么问题             | Climatix FB
+// --------|-------------------------|--------------------------------
+// L1 解耦 | 温度↔RH 物理耦合         | ABSHumidity (RH→FA 解耦基础)
+// L2 计算 | 焓值/露点 综合           | Enthalpy + 自实现 FB_DewPoint
+// L3 控制 | 温度/湿度双独立 PID      | PIDT1 × 2 (用 FA 替代 RH)
+// L3 级联| 室温→送风温SP             | aoCascLeadCtlrEx
+// L4 经济| 新风能耗决策             | FB_EnthalpyEconomizer (ENT 比较而非 T)
+// L4 夜冷| 利用夜间低温预冷         | NightCooling (原生 FB)
+// L4 保护| 防冷凝/防冻              | FB_DewPointProtect
+// L4 智能| 历史数据预测负荷         | MLPredictTrain (VVS 11.80+)
+//
+// 必要传感器清单
+// ----------------|-------------------------------|----------------------------
+// 室外 T+RH      | 焓值经济/夜冷/除湿判断        | NTC10k+电容式湿度变送器
+// 回风 T+RH      | 室内状态/焓值比较基准          | NTC10k+电容式湿度变送器
+// 送风 T+RH      | 副回路PID反馈/露点监测         | NTC10k+电容式湿度变送器
+// 区域 T+RH      | 主回路被控量/多区域加权        | NTC10k+电容式 (或壁挂式)
+// 露点 (推算)    | 防冷凝/供水温度下限            | 由 T+RH 计算 (FB_DewPoint)
+// CO2            | 新风需求控制 (室内空气品质)    | NDIR 红外 CO2 变送器
+// 阀位反馈       | 3PosCommandFB 位置闭环        | 模拟电位器 (0..10V/4..20mA)
+// 流量           | 风量/水量, 焓平衡计算          | 皮托管/电磁流量计
+// 功率           | 需量限制                       | 电流互感器/智能电表
+// 压差           | 滤网状态/风机运行判定          | 微差压变送器
+//
+// 关键原则:
+//   1. 温湿度传感器必须同点测量 (同一探头, 同一采样周期)
+//   2. 同一位置只用一个 T+RH 探头 (避免冗余带来的耦合误差)
+//   3. 露点保护优先于一切冷却输出 (安全侧 fail-safe)
+//   4. 加热/冷却死区 ≥ 1K, 加湿/除湿死区 ≥ 0.5 g/kg (避免同时动作)
+//   5. 焓值经济运行用 ENT 而非 T 作判据, 综合考虑温湿度耦合能耗
+// =============================================================================

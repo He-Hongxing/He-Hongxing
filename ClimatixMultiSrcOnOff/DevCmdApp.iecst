@@ -1,0 +1,261 @@
+// =============================================================================
+// 示例程序: 多源设备开关机逻辑应用  DevCmdApp.iecst
+// 控制场景: 一台 AHU 送风机的多源控制
+//   源 1 (Prio 1): 急停按钮 (Life Safety)
+//   源 2 (Prio 4): 防冻保护 (Critical Equipment)
+//   源 3 (Prio 7): 现场手动开关 (Manual Switch)
+//   源 4 (Prio 8): HMI 远程命令 (Manual Operator)
+//   源 5 (Prio 14): 上级 BMS 命令 (Superordinate)
+//   源 6 (Prio 15): 本地 PID 输出 (Local Program)
+//   源 7 (Prio 16): 时间调度 (BACnet Program / Schedule)
+//
+// 控制器: C600 POL648 (8 DI / 8 DO / 8 AI / 8 AO)
+// =============================================================================
+
+PROGRAM Pgm_AHU_FanControl
+    // =========================================================================
+    // 1. aoUnit 系统对象声明 (示意, 实际在 Project Studio 中实例化)
+    // =========================================================================
+    VAR
+        POL648 : aoPOL6x8 := (aoPOL6x8_InstanceData := (
+            Type1 := 1,    // DI: 急停信号
+            Type2 := 1,    // DI: 防冻报警
+            Type3 := 1,    // DI: 现场手动开关
+            Type4 := 1,    // DI: 风机运行反馈
+            Type5 := 9,    // DO: 风机命令输出
+            Type6 := 0,    // NC
+            Type7 := 0,    // NC
+            Type8 := 0     // NC
+        ));
+    END_VAR
+
+    // =========================================================================
+    // 2. aoBinaryInput / aoBinaryOutput 对象 (实例化)
+    // =========================================================================
+    VAR
+        BI_EmergencyStop : aoBinaryInput := (aoBinaryInput_InstanceData := (
+            InstanceName := '\F.\I',
+            MSGCL := 0,                        // Class 0 = 最高报警优先级
+            AlarmValue := FALSE,               // 急停信号 = FALSE 时报警 (低电平有效)
+            AlarmConfig := 508,                // 自动复位
+            AlarmTimeDelay := 0,
+            Polarity := FALSE,
+            TrackSelect := 0
+        ));
+
+        BI_FrostAlarm : aoBinaryInput := (aoBinaryInput_InstanceData := (
+            InstanceName := '\F.\I',
+            MSGCL := 1,                        // Class 1 = 高优先级
+            AlarmValue := TRUE,
+            AlarmConfig := 508,
+            AlarmTimeDelay := 5,               // 5 秒防抖
+            Polarity := FALSE,
+            TrackSelect := 0
+        ));
+
+        BI_ManualSwitch : aoBinaryInput := (aoBinaryInput_InstanceData := (
+            InstanceName := '\F.\I',
+            MSGCL := 4,                        // 4 = Operation, 不报警
+            Polarity := FALSE,
+            TrackSelect := 0
+        ));
+
+        BI_FanFeedback : aoBinaryInput := (aoBinaryInput_InstanceData := (
+            InstanceName := '\F.\I',
+            MSGCL := 1,
+            AlarmValue := FALSE,               // 反馈信号 = FALSE 但命令 = TRUE 时报警
+            AlarmConfig := 508,
+            AlarmTimeDelay := 10,              // 启动后 10 秒内无反馈 = 故障
+            Polarity := FALSE,
+            TrackSelect := 0
+        ));
+
+        BO_Fan : aoBinaryOutput := (aoBinaryOutput_InstanceData := (
+            InstanceName := '\F.\I',
+            MSGCL := 1,
+            AlarmValue := FALSE,               // 输出与命令不一致时报警
+            AlarmConfig := 508,
+            AlarmTimeDelay := 3,
+            Input1Prio := 15,                  // Val1 → Priority 15 (本地程序)
+            Input2Prio := 7,                   // Val2 → Priority 7  (现场手动)
+            Input3Prio := 0,                   // 未使用
+            Input4Prio := 0,                   // 未使用
+            Input5Prio := 0,                   // 未使用
+            Polarity := FALSE,
+            TrackSelect := 0,
+            Default := FALSE                   // 全 NULL 时默认停机
+        ));
+    END_VAR
+
+    // =========================================================================
+    // 3. 调度对象 (aoSchedule + aoCalendar, 在 Project Studio 中实例化)
+    // =========================================================================
+    VAR
+        aoSched : aoSchedule := (aoSchedule_InstanceData := (
+            InstanceName := '\F.\I',
+            EngUnit := 0,
+            SetpointCooling := 0.0,
+            SetpointHeating := 0.0
+        ));
+        // aoCalendar 略, 实际需配置
+    END_VAR
+
+    // =========================================================================
+    // 4. AccessDB 实例 (读取非声明成员)
+    // =========================================================================
+    VAR
+        dbRead  : AccessDB;    // 读 BO_Fan.OutOoService 判断是否 HMI 手动
+        dbWCmd  : AccessDB;    // 读 BI 状态 (示意, 实际可直接读 TVal)
+    END_VAR
+
+    // =========================================================================
+    // 5. 多源裁决器实例
+    // =========================================================================
+    VAR
+        fbMaster : FB_DevCmd_Master;
+
+        // 联锁源: 急停(P1) + 防冻(P4) + 风机反馈(P4)
+        aInterlockSrc   : ARRAY[1..8] OF DT_DevSrc;
+        nInterlockCount : USINT := 3;
+
+        // 优先级源: 手动开关(P7) + HMI(P8) + BMS(P14) + 本地PID(P15)
+        aPrioSrc        : ARRAY[1..8] OF DT_DevSrc;
+        nPrioCount      : USINT := 4;
+
+        // HMI 手动状态 (从 BO_Fan.OutOfService 读取)
+        bHMIHand        : BOOL;
+        bHMICmd         : BOOL;
+
+        // 简单 PID 输出 (示意, 实际应接 aoLoopController.AO 或 fbPID.Output)
+        rPIDOut         : REAL := 0.0;
+        bPIDCmd         : BOOL;
+    END_VAR
+
+    // =========================================================================
+    // 主程序逻辑
+    // =========================================================================
+
+    // ---- 1. 硬件层执行 ----
+    POL648();
+
+    // ---- 2. AO 层执行 (TVal/TRel 输入) ----
+    // 急停: DI1 取反 (急停按钮按下时 DI=FALSE, 取反后 TVal=TRUE 表示故障)
+    BI_EmergencyStop(TVal := NOT TO_BOOL(POL648.XI1), TRel := POL648.RelX1);
+    BI_FrostAlarm   (TVal := TO_BOOL(POL648.XI2),     TRel := POL648.RelX2);
+    BI_ManualSwitch (TVal := TO_BOOL(POL648.XI3),     TRel := POL648.RelX3);
+    BI_FanFeedback  (TVal := TO_BOOL(POL648.XI4),     TRel := POL648.RelX4);
+
+    // ---- 3. 读 HMI 手动模式 (AccessDB 读 OutOfService) ----
+    // OutOfService = TRUE 时表示 HMI 手动接管, 此时应用层应停止自动命令
+    dbRead(SET := FALSE, DB := BO_Fan.DB, PROP := 16#0112);   // 0x0112 = OutOfService
+    bHMIHand := TO_BOOL(dbRead.AO);
+    // HMI 命令值从另一通道获取 (略, 假设 bHMICmd 已知)
+    bHMICmd := FALSE;   // 占位, 实际接 aoSetptBit 或 HMI 写入的成员
+
+    // ---- 4. 准备联锁源 ----
+    // 急停 (Prio 1): TVal=TRUE 表示急停按下 → 应阻断 (Cmd=FALSE)
+    aInterlockSrc[1].Cmd := NOT BI_EmergencyStop.TVal;
+    aInterlockSrc[1].Prio := 1;
+    aInterlockSrc[1].Weight := 0.0;
+    aInterlockSrc[1].Enable := TRUE;
+    aInterlockSrc[1].Reliability := BI_EmergencyStop.TRel;
+
+    // 防冻 (Prio 4): TVal=TRUE 表示防冻报警 → 应阻断
+    aInterlockSrc[2].Cmd := NOT BI_FrostAlarm.TVal;
+    aInterlockSrc[2].Prio := 4;
+    aInterlockSrc[2].Enable := TRUE;
+    aInterlockSrc[2].Reliability := BI_FrostAlarm.TRel;
+
+    // 风机反馈 (Prio 4): 输出命令后无反馈 → 应阻断 (避免空转)
+    // Cmd=TRUE 表示风机反馈正常
+    aInterlockSrc[3].Cmd := BI_FanFeedback.TVal OR (NOT BO_Fan.PrVal);
+    aInterlockSrc[3].Prio := 4;
+    aInterlockSrc[3].Enable := TRUE;
+    aInterlockSrc[3].Reliability := BI_FanFeedback.TRel;
+
+    // ---- 5. 准备优先级源 ----
+    // 现场手动开关 (Prio 7)
+    aPrioSrc[1].Cmd := BI_ManualSwitch.TVal;
+    aPrioSrc[1].Prio := 7;
+    aPrioSrc[1].Enable := TRUE;
+    aPrioSrc[1].Reliability := BI_ManualSwitch.TRel;
+
+    // HMI 远程命令 (Prio 8)
+    aPrioSrc[2].Cmd := bHMICmd;
+    aPrioSrc[2].Prio := 8;
+    aPrioSrc[2].Enable := NOT bHMIHand;   // HMI 已手动接管时不参与优先级裁决
+    aPrioSrc[2].Reliability := 0;
+
+    // 上级 BMS 命令 (Prio 14, 通过 Modbus/BACnet 写入)
+    aPrioSrc[3].Cmd := FALSE;   // 占位, 实际接通讯映射变量
+    aPrioSrc[3].Prio := 14;
+    aPrioSrc[3].Enable := TRUE;
+    aPrioSrc[3].Reliability := 0;
+
+    // 本地 PID 输出 (Prio 15)
+    bPIDCmd := (rPIDOut > 5.0);   // PID 输出 > 5% 即请求开机
+    aPrioSrc[4].Cmd := bPIDCmd;
+    aPrioSrc[4].Prio := 15;
+    aPrioSrc[4].Enable := TRUE;
+    aPrioSrc[4].Reliability := 0;
+
+    // ---- 6. 调度对象执行 (略, 由 Project Studio 调度) ----
+    // aoSched(ENBL := TRUE, ...);
+
+    // ---- 7. 主裁决器调用 ----
+    fbMaster(
+        iInterlockSrc := aInterlockSrc,
+        iInterlockCount := nInterlockCount,
+        iInterlockEn := TRUE,
+        iManualEn := bHMIHand,
+        iManualCmd := bHMICmd,
+        iManualEn_src := TRUE,
+        iPrioSrc := aPrioSrc,
+        iPrioCount := nPrioCount,
+        iPrioEn := TRUE,
+        iSchedEn := TRUE,
+        iSchedPV := aoSched.PRV
+    );
+
+    // ---- 8. 输出写回 aoBinaryOutput (经 Priority 15 成员) ----
+    // fbMaster.oFinalCmd → Val1 (映射到 Priority 15)
+    BO_Fan(
+        Val1   := fbMaster.oFinalCmd,
+        Val1EN := TRUE,
+        FBack  := BI_FanFeedback.TVal,
+        TRel   := 0
+    );
+
+    // ---- 9. 写硬件 DO ----
+    POL648.XO5 := BO_Fan.PrVal;       // DO1: 风机命令继电器
+
+END_PROGRAM
+
+
+// =============================================================================
+// 使用要点
+// =============================================================================
+// 1. 联锁源 (Prio 1, 4) 应放在 iInterlockSrc 数组, 任一阻断即强制停机
+//    不进入优先级裁决, 优先级最高 (与 Climatix P1/P4 语义一致)
+//
+// 2. 优先级源 (Prio 7, 8, 14, 15) 应放在 iPrioSrc 数组
+//    按 SBT 标准 16 级 Priority Array 裁决, 数值小者优先
+//
+// 3. 调度源 (Prio 16) 直接由 iSchedPV 传入, 作为最低优先级兜底
+//    无优先级源活动时使用调度结果
+//
+// 4. HMI 手动模式通过 AccessDB 读 BO_Fan.OutOfService (0x0112)
+//    HMI 手动接管时, fbMaster 输出 HMI 命令, 自动源跟踪以便无扰切回
+//
+// 5. 风机反馈: BO_Fan.PrVal=TRUE 但 BI_FanFeedback.TVal=FALSE 超过 10s
+//    → aoBinaryInput.AlarmValue 触发故障报警 (Class 1)
+//
+// 6. 模拟量版本: fbMaster.oFinalVal 输出 0.0/100.0, 便于驱动
+//    aoAnalogOutput.Val1 (如变频风机转速命令)
+//
+// 7. 报警与变更日志:
+//    - BI_EmergencyStop: MSGCL=0 (最高), 触发立即报警
+//    - BI_FrostAlarm: MSGCL=1 (高), 5 秒延时防抖
+//    - BO_Fan: MSGCL=1, 输出与命令不一致时报警
+//    - 启用 Change Log UUID 后, 所有 HMI/BMS 写入自动记录
+// =============================================================================

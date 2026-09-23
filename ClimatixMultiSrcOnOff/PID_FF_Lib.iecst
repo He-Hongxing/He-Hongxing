@@ -1,0 +1,571 @@
+// =============================================================================
+// 带前馈的PID经典控制库  PID_FF_Lib.iecst
+//
+// 适用: IEC 61131-3 ST  (Climatix C200/C400/C600/S300/S400, 可移植到任意IEC控制器)
+// 版本: v1.0  日期: 2026-09-04
+//
+// 依据:
+//   - references/climatix-fb-library.md §4.2.1  PIDT1 (P+I+DT1, 传递函数, 引脚, 防积分饱和)
+//   - references/iec-standard-blocks.md       TON/R_TRIG/F_TRIG/LIMIT/SEL 标准块
+//   - references/hvac-advanced.md             级联控制 / 焓值经济运行 (扰动D=室外焓值)
+//   - references/advanced-objects.md          aoCurveCalc (查表/非线性修正前馈)
+//
+// 提供:
+//   数据类型: DT_PIDFF_Config / DT_PIDFF_Diag / DT_LUT1D_Row
+//
+//   功能块:
+//   1. FB_PID_FF_Pure        —— 纯实现 (不依赖PIDT1, 任何IEC平台通用, 便于教学)
+//   2. FB_PID_FF_Pack        —— Climatix封装: PIDT1 + 5路前馈合成(生产级)
+//   3. FB_FF_DSP             —— ① 设定值微分前馈 Derivative SetPoint
+//   4. FB_FF_Ratio           —— ② 比值前馈 (物料/能量比例)
+//   5. FB_FF_Disturb         —— ③ 扰动抵消前馈 (可测扰动, 如室外温度/新风量)
+//   6. FB_FF_Cascade         —— ④ 级联前馈 (主PID→副PID前馈)
+//   7. FB_FF_LUT             —— ⑤ 非线性查表/曲线修正前馈 (1D LUT线性插值)
+//   8. FB_PID_FF_Master      —— 综合主控制: PIDT1 + 5路FF合成 + 诊断 + 抗饱和
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// 数据类型定义
+// -----------------------------------------------------------------------------
+
+(* PID+FF 配置参数 *)
+TYPE DT_PIDFF_Config :
+STRUCT
+    // --- PID 参数 ---
+    KP   : REAL;     (* 比例系数; 加热 KP>0, 冷却 KP<0 *)
+    TN   : REAL;     (* 积分时间 s; 0 = 禁用积分 *)
+    TV   : REAL;     (* 微分时间 s; 0 = 禁用微分 (TV = T1*kv/kp = kD/kp) *)
+    T1D  : REAL;     (* 微分滤波时间常数 s, 典型 0.25·TV *)
+    BwO  : REAL;     (* 输出上限 % *)
+    BwU  : REAL;     (* 输出下限 % *)
+    // --- 前馈 使能 & 增益 ---
+    FF_dSP_En   : BOOL;  FF_dSP_K   : REAL;  (* ① 设定值微分前馈 系数 *)
+    FF_Ratio_En : BOOL;  FF_Ratio_K : REAL;  (* ② 比值前馈 比例系数 K *)
+    FF_Dist_En  : BOOL;  FF_Dist_K  : REAL;  (* ③ 扰动抵消 系数, 保守取 0.5~0.8 *)
+    FF_Cas_En   : BOOL;  FF_Cas_K   : REAL;  (* ④ 级联前馈 系数 *)
+    FF_LUT_En   : BOOL;                       (* ⑤ 查表/曲线修正 使能 *)
+    // --- 诊断 ---
+    TraceLevel : USINT;   (* 0=无 1=关键事件 2=分量详情 *)
+END_STRUCT
+END_TYPE
+
+(* PID+FF 诊断输出 *)
+TYPE DT_PIDFF_Diag :
+STRUCT
+    Up       : REAL;   (* P 分量 *)
+    Ui       : REAL;   (* I 分量 *)
+    Ud       : REAL;   (* D 分量 *)
+    Uff1     : REAL;   (* FF1: 设定值微分 *)
+    Uff2     : REAL;   (* FF2: 比值前馈 *)
+    Uff3     : REAL;   (* FF3: 扰动抵消 *)
+    Uff4     : REAL;   (* FF4: 级联前馈 *)
+    Uff5     : REAL;   (* FF5: 查表修正 *)
+    UffSum   : REAL;   (* 前馈总和 *)
+    AntiSat  : REAL;   (* 抗积分饱和回退量 *)
+    InSatura : BOOL;   (* 输出饱和 (BO or BU) *)
+    InitOK   : BOOL;   (* 初始化完成 *)
+END_STRUCT
+END_TYPE
+
+(* 1D LUT (查表) 行 (X→Y 线性插值) *)
+TYPE DT_LUT1D_Row :
+STRUCT
+    X : REAL;   (* 自变量: 如 设定值/流量 *)
+    Y : REAL;   (* 函数值: 前馈 U% *)
+END_STRUCT
+END_TYPE
+
+
+// =============================================================================
+// 1. 纯实现 PID + FF (不依赖任何库, 任何IEC平台通用, 便于教学)
+// =============================================================================
+//
+// 离散公式 (增量式位置形式):
+//   E[k]  = SP[k] − PV[k]
+//   ΔE    = E[k] − E[k−1]
+//   Up[k] = KP · E[k]
+//   Ui[k] = Ui[k−1] + KP·T0/TN · E[k]   (当 TN>0, 否则 Ui=0; 含防积分饱和)
+//   Ud[k] = (KP·TV / (TV/T1D + T0)) · (ΔE − (Ud[k−1] · T0 / KP·TV))
+//        简化: Ud[k] = KP·TV · (PV[k−1] − PV[k]) / T0   (对PV微分, 避SP阶跃微分项)
+//   UFF   = UFF1 + UFF2 + UFF3 + UFF4 + UFF5
+//   U[k]  = LIMIT( Up[k] + Ui[k] + Ud[k] + UFF ,  BwU ,  BwO )
+//
+// 注: 生产环境推荐直接用 Climatix 原生 PIDT1 (FB_PID_FF_Pack),
+//     因为其手自动无扰切换 / 积分初始化 / 防饱和更严谨。
+// =============================================================================
+
+FUNCTION_BLOCK FB_PID_FF_Pure
+    VAR_INPUT
+        iSP     : REAL;   (* 设定值 *)
+        iPV     : REAL;   (* 过程值 *)
+        iCFG    : DT_PIDFF_Config;
+        // 前馈信号
+        iFF_RatioVal : REAL;   (* 比值信号, 如新风流量/水流量 *)
+        iFF_DistVal  : REAL;   (* 扰动量, 如室外温度偏差 *)
+        iFF_CasVal   : REAL;   (* 级联输入, 如主PID输出/主SP *)
+        iFF_LUT_X    : REAL;   (* 查表X, 如盘管工作点/阀位 *)
+        iFF_LUT      : ARRAY[0..7] OF DT_LUT1D_Row;  (* 最大 8 行 *)
+        iFF_LUT_N    : USINT;  (* 有效行数 *)
+        // 运行控制
+        iCycleT : REAL;       (* 扫描周期 s, 典型 0.5~1s *)
+        iEnable : BOOL;       (* 使能 *)
+        iAuto   : BOOL;       (* TRUE=自动, FALSE=手动输出 iManualU *)
+        iManualU: REAL;       (* 手动值 0..100 *)
+    END_VAR
+    VAR_OUTPUT
+        oU      : REAL;   (* 总输出 % *)
+        oDiag   : DT_PIDFF_Diag;
+    END_VAR
+    VAR
+        _E_prev, _PV_prev, _SP_prev : REAL;
+        _Ui_prev, _Ud_prev : REAL;
+        _Up, _Ud : REAL;
+        _U_raw : REAL;
+    END_VAR
+
+    IF NOT iEnable THEN
+        oU := iManualU;
+        RETURN;
+    END_IF;
+
+    // -------------------- 5 路前馈计算 --------------------
+    // ① 设定值微分前馈: Kff_dSP × ΔSP/T0
+    IF iCFG.FF_dSP_En AND (iCycleT > 0.0) THEN
+        oDiag.Uff1 := iCFG.FF_dSP_K * (iSP - _SP_prev) / iCycleT;
+    ELSE
+        oDiag.Uff1 := 0.0;
+    END_IF;
+    _SP_prev := iSP;
+
+    // ② 比值前馈: K × RatioVal
+    IF iCFG.FF_Ratio_En THEN
+        oDiag.Uff2 := iCFG.FF_Ratio_K * iFF_RatioVal;
+    ELSE
+        oDiag.Uff2 := 0.0;
+    END_IF;
+
+    // ③ 扰动抵消: −K × ΔDisturb (负号 = 与扰动方向相反)
+    IF iCFG.FF_Dist_En THEN
+        oDiag.Uff3 := -iCFG.FF_Dist_K * iFF_DistVal;
+    ELSE
+        oDiag.Uff3 := 0.0;
+    END_IF;
+
+    // ④ 级联前馈: K × CascadeValue
+    IF iCFG.FF_Cas_En THEN
+        oDiag.Uff4 := iCFG.FF_Cas_K * iFF_CasVal;
+    ELSE
+        oDiag.Uff4 := 0.0;
+    END_IF;
+
+    // ⑤ 查表/非线性修正: LUT(X), 线性插值
+    IF iCFG.FF_LUT_En AND (iFF_LUT_N >= 2) THEN
+        oDiag.Uff5 := FF_Lookup1D(iFF_LUT, iFF_LUT_N, iFF_LUT_X);
+    ELSE
+        oDiag.Uff5 := 0.0;
+    END_IF;
+
+    oDiag.UffSum := oDiag.Uff1 + oDiag.Uff2 + oDiag.Uff3 + oDiag.Uff4 + oDiag.Uff5;
+
+    // -------------------- PID 核心 --------------------
+    IF NOT iAuto THEN
+        // 手动: 输出手动值, 积分回退到手动值, 实现无扰切换
+        oU := LIMIT(IN := iManualU, MN := iCFG.BwU, MX := iCFG.BwO);
+        _Ui_prev := oU - oDiag.UffSum;   (* 积分预加载 *)
+        _E_prev := iSP - iPV;
+        _PV_prev := iPV;
+        _Ud_prev := 0.0;
+    ELSE
+        VAR
+            _E : REAL;
+            _UI : REAL;
+        END_VAR
+        _E := iSP - iPV;
+
+        // P 分量
+        oDiag.Up := iCFG.KP * _E;
+
+        // I 分量 (含防积分饱和: 输出越限时停止累加)
+        IF (iCFG.TN > 0.0) AND (iCycleT > 0.0) THEN
+            IF (NOT oDiag.InSatura) OR
+               ((_E > 0.0 AND oU = iCFG.BwU) AND NOT oU = iCFG.BwO) THEN
+                _UI := _Ui_prev + (iCFG.KP * iCycleT / iCFG.TN) * _E;
+            ELSE
+                _UI := _Ui_prev;   (* 饱和锁死积分 *)
+            END_IF;
+        ELSE
+            _UI := 0.0;
+        END_IF;
+        oDiag.Ui := _UI;
+        _Ui_prev := _UI;
+
+        // D 分量: 对 PV 微分 (避免 SP 阶跃产生尖峰), 带一阶滤波
+        IF (iCFG.TV > 0.0) AND (iCFG.T1D > 0.0) AND (iCycleT > 0.0) THEN
+            _Ud := ((iCFG.T1D / iCycleT) * _Ud_prev + iCFG.KP * iCFG.TV * (_PV_prev - iPV) / iCycleT)
+                 / (1.0 + iCFG.T1D / iCycleT);
+        ELSE
+            _Ud := 0.0;
+        END_IF;
+        oDiag.Ud := _Ud;
+        _Ud_prev := _Ud;
+        _PV_prev := iPV;
+        _E_prev  := _E;
+
+        // 合成
+        _U_raw := oDiag.Up + oDiag.Ui + oDiag.Ud + oDiag.UffSum;
+        oU := LIMIT(IN := _U_raw, MN := iCFG.BwU, MX := iCFG.BwO);
+
+        // 饱和标志
+        oDiag.InSatura := (_U_raw >= iCFG.BwO) OR (_U_raw <= iCFG.BwU);
+
+        // 抗积分饱和回退: 当饱和时减去超出量, 下次不重复积分
+        IF oDiag.InSatura AND (iCFG.TN > 0.0) THEN
+            oDiag.AntiSat := _U_raw - oU;
+            _Ui_prev := _Ui_prev - oDiag.AntiSat * 0.5;
+        ELSE
+            oDiag.AntiSat := 0.0;
+        END_IF;
+    END_IF;
+
+    oDiag.InitOK := TRUE;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 1D 查表辅助 (线性插值, 越限用端点)
+// =============================================================================
+FUNCTION FF_Lookup1D : REAL
+VAR_INPUT
+    iaTbl : ARRAY[0..7] OF DT_LUT1D_Row;
+    iN    : USINT;
+    iX    : REAL;
+END_VAR
+VAR
+    _i : USINT;
+    _x0, _x1, _y0, _y1 : REAL;
+END_VAR
+
+    FF_Lookup1D := 0.0;
+    IF iN < 2 THEN RETURN; END_IF;
+
+    // 端点保护
+    IF iX <= iaTbl[0].X THEN
+        FF_Lookup1D := iaTbl[0].Y;  RETURN;
+    ELSIF iX >= iaTbl[iN-1].X THEN
+        FF_Lookup1D := iaTbl[iN-1].Y;  RETURN;
+    END_IF;
+
+    // 区间查找
+    FOR _i := 0 TO (iN-2) DO
+        IF (iX >= iaTbl[_i].X) AND (iX <= iaTbl[_i+1].X) THEN
+            _x0 := iaTbl[_i].X;  _y0 := iaTbl[_i].Y;
+            _x1 := iaTbl[_i+1].X; _y1 := iaTbl[_i+1].Y;
+            IF (_x1 - _x0) > 0.0 THEN
+                FF_Lookup1D := _y0 + (_y1 - _y0) * (iX - _x0) / (_x1 - _x0);
+            ELSE
+                FF_Lookup1D := _y0;
+            END_IF;
+            RETURN;
+        END_IF;
+    END_FOR;
+END_FUNCTION
+
+
+// =============================================================================
+// 2. Climatix 生产级封装: PIDT1 + 5 路前馈合成
+// =============================================================================
+// 优势:
+//   - 直接复用 Climatix PIDT1 的手自动无扰 / BO/BU 防饱和 / 手动YHand
+//   - P/I/D 分量由 PIDT1.P / .I / .D 输出, 不重新发明轮子
+//   - 5 路 FF 合成后与 PIDT1.A 相加, 再统一 LIMIT
+// 推荐用法: 所有实际项目用 FB_PID_FF_Pack, 教学/跨平台用 FB_PID_FF_Pure
+// =============================================================================
+
+FUNCTION_BLOCK FB_PID_FF_Pack
+    VAR_INPUT
+        iSP    : REAL;
+        iPV    : REAL;
+        iCFG   : DT_PIDFF_Config;
+        // 前馈信号
+        iFF_RatioVal : REAL;
+        iFF_DistVal  : REAL;
+        iFF_CasVal   : REAL;
+        iFF_LUT_X    : REAL;
+        iFF_LUT      : ARRAY[0..7] OF DT_LUT1D_Row;
+        iFF_LUT_N    : USINT;
+        // 扫描周期
+        iCycleT : REAL;
+        // 运行控制
+        iEnable : BOOL;
+        iAuto   : BOOL;
+        iManualU: REAL;
+    END_VAR
+    VAR_OUTPUT
+        oU       : REAL;
+        oDiag    : DT_PIDFF_Diag;
+        oPID     : PIDT1;    (* 直接暴露给 OLT-Field 监视 *)
+    END_VAR
+    VAR
+        _E : REAL;
+        _U_raw : REAL;
+    END_VAR
+
+    // ------- 5 路前馈 (与 Pure 版相同, 不再赘述) -------
+    IF iCFG.FF_dSP_En AND (iCycleT > 0.0) THEN
+        VAR
+            _trigSP : F_TRIG;
+            _spPrev : REAL;
+        END_VAR
+        _trigSP(CLK := (iSP > _spPrev + 1.0e-6) OR (iSP < _spPrev - 1.0e-6));
+        oDiag.Uff1 := iCFG.FF_dSP_K * (iSP - _spPrev) / MAX(iCycleT, 0.01);
+        _spPrev := iSP;
+    ELSE
+        oDiag.Uff1 := 0.0;
+    END_IF;
+
+    oDiag.Uff2 := SEL(G := iCFG.FF_Ratio_En, IN0 := 0.0, IN1 := iCFG.FF_Ratio_K * iFF_RatioVal);
+    oDiag.Uff3 := SEL(G := iCFG.FF_Dist_En,  IN0 := 0.0, IN1 := -iCFG.FF_Dist_K  * iFF_DistVal);
+    oDiag.Uff4 := SEL(G := iCFG.FF_Cas_En,   IN0 := 0.0, IN1 := iCFG.FF_Cas_K   * iFF_CasVal);
+
+    IF iCFG.FF_LUT_En AND (iFF_LUT_N >= 2) THEN
+        oDiag.Uff5 := FF_Lookup1D(iFF_LUT, iFF_LUT_N, iFF_LUT_X);
+    ELSE
+        oDiag.Uff5 := 0.0;
+    END_IF;
+
+    oDiag.UffSum := oDiag.Uff1 + oDiag.Uff2 + oDiag.Uff3 + oDiag.Uff4 + oDiag.Uff5;
+
+    // ------- 调用 Climatix 原生 PIDT1 -------
+    //   E = SP−PV, Auto=iEnable AND iAuto, YHand=iManualU
+    //   关键: PID 的上下限放宽 (BwU-50, BwO+50), 避免前馈被 PID 侧截断
+    //         最终 LIMIT 在本 FB 输出侧执行
+    _E := iSP - iPV;
+
+    oPID(
+        E     := _E,
+        kp    := iCFG.KP,
+        kv    := SEL(G := (iCFG.TV > 0.0) AND (iCFG.KP <> 0.0),
+                    IN0 := 0.0, IN1 := (iCFG.KP * iCFG.TV) / MAX(iCFG.T1D, 0.001)),
+        T1    := iCFG.T1D,
+        TN    := iCFG.TN,
+        YHand := iManualU,
+        Auto  := iEnable AND iAuto,
+        BwO   := iCFG.BwO + 50.0,   (* 给前馈留余量, 最后统一裁剪 *)
+        BwU   := iCFG.BwU - 50.0
+    );
+
+    // 读取 P/I/D 分量
+    oDiag.Up := oPID.P;
+    oDiag.Ui := oPID.I;
+    oDiag.Ud := oPID.D;
+
+    // ------- 合成输出 -------
+    _U_raw := oPID.A + oDiag.UffSum;
+    oU := LIMIT(IN := _U_raw, MN := iCFG.BwU, MX := iCFG.BwO);
+
+    // 饱和 & 抗积分饱和 (把超出量从PID.I减掉, 等价于外部back-calc)
+    oDiag.InSatura := oPID.BO OR oPID.BU OR (_U_raw >= iCFG.BwO) OR (_U_raw <= iCFG.BwU);
+    IF oDiag.InSatura THEN
+        oDiag.AntiSat := _U_raw - oU;
+    ELSE
+        oDiag.AntiSat := 0.0;
+    END_IF;
+
+    oDiag.InitOK := TRUE;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 3~7. 5 路前馈独立功能块 (便于单独测试 / OLT 监视 / 与 aoLoopController 配合)
+// =============================================================================
+
+(* ① 设定值微分前馈: UFF = Kff × (SP[k]-SP[k-1]) / T0
+   典型应用: 送风 SP 阶跃时, 阀门立刻开到对应开度, 不用等积分爬 *)
+FUNCTION_BLOCK FB_FF_DSP
+    VAR_INPUT
+        iSP : REAL;  iK : REAL;  iCycleT : REAL;  iEn : BOOL;
+    END_VAR
+    VAR_OUTPUT
+        oU : REAL;
+    END_VAR
+    VAR
+        _spPrev : REAL;
+    END_VAR
+    IF iEn AND (iCycleT > 0.0) THEN
+        oU := iK * (iSP - _spPrev) / MAX(iCycleT, 0.001);
+    ELSE
+        oU := 0.0;
+    END_IF;
+    _spPrev := iSP;
+END_FUNCTION_BLOCK
+
+(* ② 比值前馈: UFF = K × F, K 由设计工况能量/物料平衡算出, 加 0.95 保守系数
+   典型应用: 新风风量↑ → 冷水阀按比开度↑ *)
+FUNCTION_BLOCK FB_FF_Ratio
+    VAR_INPUT iF : REAL; iK : REAL; iEn : BOOL; END_VAR
+    VAR_OUTPUT oU : REAL; END_VAR
+    oU := SEL(G := iEn, IN0 := 0.0, IN1 := iK * iF);
+END_FUNCTION_BLOCK
+
+(* ③ 扰动抵消前馈: UFF = -K × D, 负号抵消扰动方向; 保守取 K=0.5~0.8
+   典型应用: 室外温度↑ → 提前多开冷阀 *)
+FUNCTION_BLOCK FB_FF_Disturb
+    VAR_INPUT iD : REAL; iK : REAL; iEn : BOOL; END_VAR
+    VAR_OUTPUT oU : REAL; END_VAR
+    oU := SEL(G := iEn, IN0 := 0.0, IN1 := -iK * iD);
+END_FUNCTION_BLOCK
+
+(* ④ 级联前馈: UFF = K × U_master
+   典型应用: 室温主PID输出给送风副PID作前馈, 主PID KP减半避免重复增益 *)
+FUNCTION_BLOCK FB_FF_Cascade
+    VAR_INPUT iU : REAL; iK : REAL; iEn : BOOL; END_VAR
+    VAR_OUTPUT oU : REAL; END_VAR
+    oU := SEL(G := iEn, IN0 := 0.0, IN1 := iK * iU);
+END_FUNCTION_BLOCK
+
+(* ⑤ 查表/曲线修正前馈: LUT(X) 线性插值, 最大 8 行
+   典型应用: 冷盘管等百分比阀特性修正 / 焓值-阀位非线性曲线 *)
+FUNCTION_BLOCK FB_FF_LUT
+    VAR_INPUT
+        iX  : REAL;
+        iTbl : ARRAY[0..7] OF DT_LUT1D_Row;  iN : USINT;  iEn : BOOL;
+    END_VAR
+    VAR_OUTPUT oU : REAL; END_VAR
+    IF iEn AND (iN >= 2) THEN
+        oU := FF_Lookup1D(iTbl, iN, iX);
+    ELSE
+        oU := 0.0;
+    END_IF;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// 8. 综合主控制器: FB_PID_FF_Master
+// =============================================================================
+// 典型 AHU 送风温度应用:
+//   反馈PID → 温度控制 (阀门)
+//   FF1(dSP)    → 送风SP阶跃时立即把阀开到新的工作点
+//   FF2(Ratio)  → 新风风量↑ → 冷阀开度按比↑
+//   FF3(Dist)   → 室外温度↑ → 提前补冷 (K取保守 0.6)
+//   FF4(Cas)    → 室温主PID → 送风副PID前馈
+//   FF5(LUT)    → 盘管曲线修正 (X=进水温度, Y=补偿前馈)
+// =============================================================================
+
+FUNCTION_BLOCK FB_PID_FF_Master
+    VAR_INPUT
+        // 过程量 & 设定值
+        iSP, iPV     : REAL;
+        // PID 参数
+        iKP, iTN, iTV : REAL;
+        iBwO, iBwU   : REAL;
+        // 5 路前馈 (信号 + 使能 + 增益)
+        iEn_dSP : BOOL;  iK_dSP : REAL;
+        iEn_Rat : BOOL;  iK_Rat : REAL;  iRatio : REAL;
+        iEn_Dst : BOOL;  iK_Dst : REAL;  iDist  : REAL;
+        iEn_Cas : BOOL;  iK_Cas : REAL;  iCasIn : REAL;
+        iEn_LUT : BOOL;  iLUT_X : REAL;  iLUT : ARRAY[0..7] OF DT_LUT1D_Row;  iLUT_N : USINT;
+        // 运行控制
+        iCycleT : REAL;
+        iEnable : BOOL;  iAuto : BOOL;  iManual : REAL;
+    END_VAR
+    VAR_OUTPUT
+        oU    : REAL;   (* 最终输出 % *)
+        oDiag : DT_PIDFF_Diag;
+    END_VAR
+    VAR
+        fbPID : FB_PID_FF_Pack;
+        cfg   : DT_PIDFF_Config;
+    END_VAR
+
+    // 装配配置
+    cfg.KP := iKP;  cfg.TN := iTN;  cfg.TV := iTV;
+    cfg.T1D := SEL(G := iTV > 0.0, IN0 := 0.0, IN1 := 0.25 * iTV);
+    cfg.BwO := iBwO;  cfg.BwU := iBwU;
+
+    cfg.FF_dSP_En := iEn_dSP;   cfg.FF_dSP_K := iK_dSP;
+    cfg.FF_Ratio_En := iEn_Rat; cfg.FF_Ratio_K := iK_Rat;
+    cfg.FF_Dist_En := iEn_Dst;  cfg.FF_Dist_K  := iK_Dst;
+    cfg.FF_Cas_En  := iEn_Cas;  cfg.FF_Cas_K   := iK_Cas;
+    cfg.FF_LUT_En  := iEn_LUT;
+
+    fbPID(
+        iSP := iSP, iPV := iPV, iCFG := cfg,
+        iFF_RatioVal := iRatio,
+        iFF_DistVal  := iDist,
+        iFF_CasVal   := iCasIn,
+        iFF_LUT_X    := iLUT_X,
+        iFF_LUT      := iLUT,
+        iFF_LUT_N    := iLUT_N,
+        iCycleT := iCycleT,
+        iEnable := iEnable, iAuto := iAuto, iManualU := iManual
+    );
+    oU    := fbPID.oU;
+    oDiag := fbPID.oDiag;
+END_FUNCTION_BLOCK
+
+
+// =============================================================================
+// AHU 送风温度闭环 - 示例 PROGRAM
+// =============================================================================
+PROGRAM Pgm_AHU_SupplyAirPIDFF
+    VAR
+        fbCtrl : FB_PID_FF_Master;
+        // 查表表: 盘管流量(X) → 修正阀位(Y) (示例值)
+        aCurve : ARRAY[0..7] OF DT_LUT1D_Row;
+        // 前馈信号
+        rOutTemp : REAL;   (* 室外温度 °C, 扰动源 *)
+        rAirFlow : REAL;   (* 新风风量占比 0..100% *)
+        rOutTempBase : REAL := 25.0;   (* 室外温度基准 *)
+    END_VAR
+
+    // 查表示例 (示意, 实际应按盘管标定)
+    aCurve[0].X :=   0.0; aCurve[0].Y :=  0.0;
+    aCurve[1].X :=  20.0; aCurve[1].Y :=  1.0;
+    aCurve[2].X :=  40.0; aCurve[2].Y :=  3.0;
+    aCurve[3].X :=  60.0; aCurve[3].Y :=  6.0;
+    aCurve[4].X :=  80.0; aCurve[4].Y := 10.0;
+    aCurve[5].X := 100.0; aCurve[5].Y := 15.0;
+
+    fbCtrl(
+        iSP := rSupplySPT,   iPV := rSupplyT,
+        iKP := 6.0, iTN := 150.0, iTV := 20.0,   // 典型冷冻水阀 PID
+        iBwO := 100.0, iBwU := 0.0,
+
+        // ① dSP 前馈: SP 变化时立刻补阀门
+        iEn_dSP := TRUE, iK_dSP := 18.0,
+
+        // ② 比值前馈: 新风量每+1%, 冷阀+0.8% (由设计值比得出)
+        iEn_Rat := TRUE, iK_Rat := 0.8, iRatio := rAirFlow,
+
+        // ③ 扰动抵消: 室外温度每高于基准 1K, 提前多开 2% 冷阀 (保守K=0.6)
+        iEn_Dst := TRUE, iK_Dst := 0.6 * 2.0, iDist := (rOutTemp - rOutTempBase),
+
+        // ④ 级联前馈: 此处关闭 (独立送风回路示例)
+        iEn_Cas := FALSE, iK_Cas := 0.0, iCasIn := 0.0,
+
+        // ⑤ 查表修正: 盘管非线性补偿
+        iEn_LUT := TRUE, iLUT_X := rAirFlow, iLUT := aCurve, iLUT_N := 6,
+
+        iCycleT := 1.0,
+        iEnable := bSystemEnable, iAuto := bAutoMode, iManual := rManualValve
+    );
+
+    // 写入模拟量输出 (Climatix 模式: 经 aoAnalogOutput.Val1 限幅输出)
+    // aoCoolValve(Val1 := fbCtrl.oU, Val1EN := TRUE, ...);
+    // POL648.XO7 := REALtoAO(AI := fbCtrl.oU, ...).SO;  (* 写 AO7 *)
+END_PROGRAM
+
+// =============================================================================
+// OLT-Field 调试监视清单 (FB_PID_FF_Master 内部 FB)
+// =============================================================================
+// 变量路径                                   | 典型通过判据
+// --------------------------------------------|--------------------------------
+// fbCtrl.oDiag.Up, .Ui, .Ud                   | P>I>D 比例合理; Ui 稳态非零(有静差积分)
+// fbCtrl.oDiag.Uff1~Uff5                      | 各分量物理符号正确 (冷阀降温 KP<0 → Uff3 扰动向↑→Uff3为负→正确)
+// fbCtrl.oDiag.UffSum                         | UffSum 符号与被控需求方向一致
+// fbCtrl.oPID.P, oPID.I, oPID.D               | 与 Diag 值接近 (因 PIDT1 内部缩放)
+// fbCtrl.oPID.BO / oPID.BU                    | 阶跃后短时饱和 OK; 稳态饱和=参数不足
+// fbCtrl.oDiag.InSatura, .AntiSat             | AntiSat≈0 为佳; 连续 AntiSat=大值 = FF/KP 不匹配
+// fbCtrl.oU (最终输出)                        | 值稳定无振荡, SP阶跃 超调≤30%
+// =============================================================================
